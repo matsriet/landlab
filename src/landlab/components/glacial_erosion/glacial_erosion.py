@@ -1,6 +1,8 @@
 from landlab import Component
 from landlab import RasterModelGrid
+from landlab.components import FlowAccumulator
 from landlab.utils.return_array import return_array_at_node
+import numpy as np
 
 PI = 3.14159265359
 
@@ -21,6 +23,7 @@ class Swath():
         discharge,
         slope_angle,
         width,
+        max_ice_thickness,
         node_ids,
         node_elevations,
         node_distances,
@@ -29,7 +32,8 @@ class Swath():
         ):
 
         if slope_angle == 0:
-            print('slope_angle in swath is exactly 0, for which the equations break.')
+            print('Warning: slope_angle in swath is exactly 0, for which the equations break. Setting slope to be 0.001')
+            slope_angle = 0.001
         
         self._AB3 = AB3
         self.discharge = discharge
@@ -63,7 +67,7 @@ class Swath():
             print(' ')
         '''
 
-        self.ice_level = node_elevations[0] + width/2
+        self.ice_level = node_elevations[0] + max_ice_thickness
 
         # Sort the swath nodes by distance, required to integrate over the swath
         sort_zip = sorted(zip(node_distances, node_elevations, node_ids))
@@ -157,17 +161,19 @@ class GlacialErosion(Component):
     def __init__(
         self,
         grid,
+        equilibrium_line_altitude=None,
+        full_ice_altitude=None,
+        precipitation_rate=1,
         width_scaling_exp=0.3,
         width_scaling_const=1, #150
+        thickness_to_width_ratio=0.5,
         density_ice=920,
         grav_accel = 10,
         glen_exp = 3, #Not used at the moment, hardcoded. See if solutions to differential equations can handle varying this.
         erosion_exp = 2,
         erosion_const = 2.5*10**(-6),
         glen_const = 24*10**(-25),
-        discharge_field="surface_water__discharge",
         ):
-        
         
         """Initialize the GlacialErosion model.
 
@@ -175,23 +181,30 @@ class GlacialErosion(Component):
         ----------
         grid : ModelGrid
             Landlab ModelGrid object
+        precipitation_rate : array or float
+            Rate of precipitation [L/T].
+        equilibrium_line_altitude : float
+            Elevation of the equilibrium line, where ice accumulation == ablation [L]. If set to the standard value of None, assumes that all precipitation is converted to ice.
+        full_ice_altitude : float
+            Elevation of the line where all precipitation is converted to ice [L]. If set to the standard value of None, assumes that all precipitation is converted to ice.
         width_scaling_exp : float
-            Catchment area to glacier width power law exponent. Defaults to 0.3 (Hergarten, 2021).
+            Discharge to glacier width power law exponent. Defaults to 0.3 (Hergarten, 2021).
+        width_scaling_const: 
+            Discharge to glacier width power law proportionality constant (units vary depending on the value of width_scaling_exp).
+        thickness_to_width_ratio:
+            Assumed thickness to width ratio for the glacier [-]. Use 0.5 to have semicircular glacier cross-sections.
         density_ice : float
             Denisty of ice [M/L^3]. Defaults to 920 kg/m^3.
-        g : float
+        grav_accel : float
             Gravitation acceleration [L/T^2]. Defaults to 10 m/s^2.
         glen_exp : float
             Glen-Nye flow law exponent. Defaults to 3.
         erosion_exp : float
             Basal velocity to erosion rate power law exponent. Defaults to 2.
         erosion_const : float
-            Basal velocity to erosion rate proportionality constant (units vary depending on the value of m). Defaults to 2.5*10**(-6) (Braedstrup et al., 2016).
+            Basal velocity to erosion rate proportionality constant (units vary depending on the value of erosion_exp). Defaults to 2.5*10**(-6) (Braedstrup et al., 2016).
         glen_const : float
-            Glen-Nye flow law proportionality constant (units vary depending on the value of n). Defaults to 24*10**(-25) (Budd & Jacka 1989, Cuffey & Patterson: The Physics of Glaciers).
-        discharge_field : float, field name, or array
-            Discharge [L^2/T].
-        
+            Glen-Nye flow law proportionality constant (units vary depending on the value of glen_exp). Defaults to 24*10**(-25) (Budd & Jacka 1989, Cuffey & Patterson: The Physics of Glaciers).
         """
 
         super().__init__(grid)
@@ -201,23 +214,31 @@ class GlacialErosion(Component):
         else:
             self._link_lengths = grid.length_of_link
 
-        self._flow_receivers = grid.at_node["flow__receiver_node"]
+        if isinstance(precipitation_rate, (int, float)):
+            precipitation_rate = np.full(grid.number_of_nodes, precipitation_rate)
+
+        self._grid = grid
         self._node_x = grid.node_x
         self._node_y = grid.node_y
         self._dx = grid.dx
         self._dy = grid.dy
-        self._q = return_array_at_node(grid, discharge_field)
-        self._topographic__elevation = grid.at_node["topographic__elevation"]
-        self._slope = grid.at_node["topographic__steepest_slope"]
+
+        self._topographic__elevation = self.grid.at_node["topographic__elevation"]
+        self._precipitation_rate = precipitation_rate
+        self._equilibrium_line_altitude = equilibrium_line_altitude
+        self._full_ice_altitude = full_ice_altitude
+        self._determine_flow()  
 
         self._width_scaling_exp = width_scaling_exp
         self._width_scaling_const = width_scaling_const
+        self._thickness_to_width_ratio = thickness_to_width_ratio
         self._density_ice = density_ice
         self._grav_accel = grav_accel
         self._glen_exp = glen_exp
         self._erosion_exp = erosion_exp
         self._erosion_const = erosion_const
         self._glen_const = glen_const
+
 
     def _dist_two_nodes(self, node1, node2):
         '''Calculate the horizontal euclidian distance between two nodes on the modelgrid.
@@ -283,6 +304,22 @@ class GlacialErosion(Component):
                 swath += self._donors_in_swath(donor, original_node, cardinal_flowline, width_swath)
         return swath
     
+    def _determine_flow(self):
+        if self._equilibrium_line_altitude == None or self._full_ice_altitude == None:
+            self._precipitation_rate_ice = self._precipitation_rate
+        else:
+            ice_multiplier = (self._topographic__elevation - self._equilibrium_line_altitude)/(self._full_ice_altitude - self._equilibrium_line_altitude)
+            self._precipitation_rate_ice = self._precipitation_rate * ice_multiplier.clip(max=1)
+
+        print(self._precipitation_rate_ice)
+
+        fa = FlowAccumulator(self.grid, flow_director="D8", runoff_rate=self._precipitation_rate_ice, depression_finder="DepressionFinderAndRouter")
+        fa.run_one_step()
+
+        self._q = return_array_at_node(self.grid, "surface_water__discharge")
+        self._flow_receivers = self.grid.at_node["flow__receiver_node"]
+        self._slope = self.grid.at_node["topographic__steepest_slope"]
+    
     def _update_ice_values(self, node, basal_velocity, ice_thickness, number_of_nodes_in_swath):
         if basal_velocity > self.sliding_velocities[node]:
             self.sliding_velocities[node] = basal_velocity
@@ -316,7 +353,7 @@ class GlacialErosion(Component):
                 swath_node_distances = [self._dist_two_nodes(center_node, node) for node in swath_node_ids]
                 swath_node_elevations = [self._topographic__elevation[node] for node in swath_node_ids]
 
-                swath_object = Swath(AB3, total_discharge, slope_along_flow, glacier_width, swath_node_ids, swath_node_elevations, swath_node_distances)
+                swath_object = Swath(AB3, total_discharge, slope_along_flow, glacier_width, glacier_width*self._thickness_to_width_ratio, swath_node_ids, swath_node_elevations, swath_node_distances)
                 swath_object.find_basal_velocities()
 
                 for n, node in enumerate(swath_object.node_ids):
