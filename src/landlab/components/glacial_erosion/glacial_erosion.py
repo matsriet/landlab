@@ -43,30 +43,6 @@ class Swath():
         self.iteration_attempts = max_iteration_attempts
         self.velocity_error_margin = velocity_error_margin
 
-        '''
-        # Determine glacier height from remaining distance from most distant node to the glacier width and its slope
-        most_distant_node = node_distances.index(max(node_distances))
-        ddist = node_distances[most_distant_node] - node_distances[most_distant_node-1] 
-        delev = node_elevations[most_distant_node] - node_elevations[most_distant_node-1]
-        most_distant_slope = delev/ddist
-
-        self.ice_level = node_elevations[most_distant_node] + most_distant_slope*(width/2 - node_distances[most_distant_node]) 
-        if self.ice_level < max(node_elevations):
-            
-            print('nodes      =', node_ids)
-            print('distances  =', [int(dist) for dist in node_distances])
-            print('elevations =', [int(elev) for elev in node_elevations])
-            print('ice level  =', self.ice_level)
-            print('md node    =', most_distant_node)
-            print('md elev.   =', node_elevations[most_distant_node])
-            print('md dist.   =', node_distances[most_distant_node])
-            print('md slope   =', most_distant_slope)
-            print('width/2    =', width/2)
-            print('ddist      =', ddist)
-            print('delev      =', delev)
-            print(' ')
-        '''
-
         self.ice_level = node_elevations[0] + max_ice_thickness
 
         # Sort the swath nodes by distance, required to integrate over the swath
@@ -206,13 +182,6 @@ class GlacialErosion(Component):
         if isinstance(precipitation_rate, (int, float)):
             precipitation_rate = np.full(grid.number_of_nodes, precipitation_rate)
 
-        self._grid = grid
-        self._node_x = grid.node_x
-        self._node_y = grid.node_y
-        self._dx = grid.dx
-        self._dy = grid.dy
-
-        self._topographic__elevation = self.grid.at_node["topographic__elevation"]
         self._precipitation_rate = precipitation_rate
         self._equilibrium_line_altitude = equilibrium_line_altitude
         self._full_ice_altitude = full_ice_altitude
@@ -228,7 +197,6 @@ class GlacialErosion(Component):
         self._erosion_const = erosion_const
         self._glen_const = glen_const
 
-
     def _dist_two_nodes(self, node1, node2):
         '''Calculate the horizontal euclidian distance between two nodes on the modelgrid.
         node1 : int
@@ -239,13 +207,13 @@ class GlacialErosion(Component):
         if node1 == node2:
             distance = 0
         else: 
-            distance = ((self._node_x[node1] - self._node_x[node2])**2 + (self._node_y[node1] - self._node_y[node2])**2)**0.5
+            distance = ((self._grid.node_x[node1] - self._grid.node_x[node2])**2 + (self._grid.node_y[node1] - self._grid.node_y[node2])**2)**0.5
         return distance
     
     def _glacier_width(self, node):
         ''' Calculates the empirical glacier width for a given node.
         '''
-        return self._width_scaling_const*(self._q[node]*self._dx)**self._width_scaling_exp
+        return self._width_scaling_const*(self._q[node]*self._grid.dx)**self._width_scaling_exp
     
     def _donors(self, node):
         '''List indices of nodes which flow into the target node, exept itself.
@@ -297,15 +265,15 @@ class GlacialErosion(Component):
         if self._equilibrium_line_altitude == None or self._full_ice_altitude == None:
             self._precipitation_rate_ice = self._precipitation_rate
         else:
-            ice_multiplier = (self._topographic__elevation - self._equilibrium_line_altitude)/(self._full_ice_altitude - self._equilibrium_line_altitude)
+            ice_multiplier = (self._grid.at_node["topographic__elevation"] - self._equilibrium_line_altitude)/(self._full_ice_altitude - self._equilibrium_line_altitude)
             self._precipitation_rate_ice = self._precipitation_rate * ice_multiplier.clip(max=1)
 
-        fa = FlowAccumulator(self.grid, flow_director="D8", runoff_rate=self._precipitation_rate_ice, depression_finder="DepressionFinderAndRouter")
+        fa = FlowAccumulator(self._grid, flow_director="D8", runoff_rate=self._precipitation_rate_ice, depression_finder="DepressionFinderAndRouter")
         fa.run_one_step()
 
-        self._q = return_array_at_node(self.grid, "surface_water__discharge")
-        self._flow_receivers = self.grid.at_node["flow__receiver_node"]
-        self._slope = self.grid.at_node["topographic__steepest_slope"]
+        self._q = return_array_at_node(self._grid, "surface_water__discharge")
+        self._flow_receivers = self._grid.at_node["flow__receiver_node"]
+        self._slope = self._grid.at_node["topographic__steepest_slope"]
     
     def _update_ice_values(self, node, basal_velocity, ice_thickness, number_of_nodes_in_swath):
         if basal_velocity > self.sliding_velocities[node]:
@@ -316,29 +284,28 @@ class GlacialErosion(Component):
                 self.node_info_from_swath[node] = 1
 
     def erosion_rate_ice(self):
-        num_gridcells = len(self._topographic__elevation)
-        self.sliding_velocities = [0]*num_gridcells
-        self.ice_thickness = [0]*num_gridcells
-        self.erosion_rate = [0]*num_gridcells
-        self.node_info_from_swath = [0]*num_gridcells
+        self.sliding_velocities = [0]*self._grid.number_of_nodes
+        self.ice_thickness = [0]*self._grid.number_of_nodes
+        self.erosion_rate = [0]*self._grid.number_of_nodes
+        self.node_info_from_swath = [0]*self._grid.number_of_nodes
 
-        for center_node in range(num_gridcells):
+        for center_node in range(self._grid.number_of_nodes):
             # Calculate glacier width and flow parameters
             glacier_width = self._glacier_width(center_node)
             slope_along_flow = max(self._slope[center_node], 0.0001) # Artifically set a lower bound to the slope to prevent it to become 0.
 
             B = -0.5*self._density_ice*self._grav_accel*_sinarctan(slope_along_flow)
             AB3 = self._glen_const*B**3
-            total_discharge = self._q[center_node]*self._dx # Check met benjamin of _dx de juiste is, of dat link lengths niet beter is oid...
+            total_discharge = self._q[center_node]*self._grid.dx # Check met benjamin of _dx de juiste is, of dat link lengths niet beter is oid...
 
-            if glacier_width/2 > self._dx:
+            if glacier_width/2 > self._grid.dx:
                 # Find which nodes belong to the swath
                 cardinal_flowline = self._cardinal_flowline(center_node)
                 donor_indices = self._donors_in_swath(center_node, center_node, cardinal_flowline, glacier_width)
 
                 swath_node_ids = [center_node] + donor_indices
                 swath_node_distances = [self._dist_two_nodes(center_node, node) for node in swath_node_ids]
-                swath_node_elevations = [self._topographic__elevation[node] for node in swath_node_ids]
+                swath_node_elevations = [self._grid.at_node["topographic__elevation"][node] for node in swath_node_ids]
 
                 swath_object = Swath(AB3, total_discharge, slope_along_flow, glacier_width, glacier_width*self._thickness_to_width_ratio, swath_node_ids, swath_node_elevations, swath_node_distances)
                 swath_object.find_basal_velocities()
