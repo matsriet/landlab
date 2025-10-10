@@ -5,6 +5,7 @@ from landlab.utils.return_array import return_array_at_node
 import numpy as np
 
 PI = 3.14159265359
+SECPERYEAR = 31556926
 
 def _cosarctan(slope):
     ''' Calculates the cosine of a fractional slope. Uses cos(arctan(slope)) = 1/((1+slope**2)**0.5) 
@@ -82,7 +83,7 @@ class Swath():
     
     def find_basal_velocities(self):
         radii = [(self.ice_thicknesses[i]**2 + self.node_distances[i]**2)**0.5 for i in range(len(self.node_distances))]
-        self.velocity_0 = (self.discharge/(PI*2/3*(-self._AB3)**0.5))**(2/3) #The velocity at (0,0) which yeilds the discharge through a semicircular glacier with maximal radius.
+        self.velocity_0 = (self.discharge/(PI*2/3*(-1/self._AB3)**0.5))**(2/3) #The velocity at (0,0) which yeilds the discharge through a semicircular glacier with maximal radius.
 
         max_radius = self._max_allowed_radius()
 
@@ -95,7 +96,6 @@ class Swath():
             self.basal_velocities = [0]*len(self.node_ids)
 
         else:
-            print('Iterating for the velocities...')
             previous_velocity_0 = self.velocity_0
             # Here, iteratively calculate velocities such that the total discharge is solved but there are no nonnegative velocities.
             for i in range(self.iteration_attempts):
@@ -131,9 +131,9 @@ class GlacialErosion(Component):
         precipitation_rate=1,
         width_scaling_exp=0.3,
         width_scaling_const=1, #150
-        thickness_to_width_ratio=0.5,
+        thickness_to_width_ratio=0.25,
         density_ice=920,
-        grav_accel = 10,
+        grav_accel = 9.8,
         glen_exp = 3, #Not used at the moment, hardcoded. See if solutions to differential equations can handle varying this.
         erosion_exp = 2,
         erosion_const = 2.5*10**(-6),
@@ -147,29 +147,29 @@ class GlacialErosion(Component):
         grid : ModelGrid
             Landlab ModelGrid object
         precipitation_rate : array or float
-            Rate of precipitation [L/T].
+            Rate of precipitation [m/a].
         equilibrium_line_altitude : float
-            Elevation of the equilibrium line, where ice accumulation == ablation [L]. If set to the standard value of None, assumes that all precipitation is converted to ice.
+            Elevation of the equilibrium line, where ice accumulation == ablation [m]. If set to the standard value of None, assumes that all precipitation is converted to ice.
         full_ice_altitude : float
-            Elevation of the line where all precipitation is converted to ice [L]. If set to the standard value of None, assumes that all precipitation is converted to ice.
+            Elevation of the line where all precipitation is converted to ice [m]. If set to the standard value of None, assumes that all precipitation is converted to ice.
         width_scaling_exp : float
             Discharge to glacier width power law exponent. Defaults to 0.3 (Hergarten, 2021).
         width_scaling_const: 
             Discharge to glacier width power law proportionality constant (units vary depending on the value of width_scaling_exp).
         thickness_to_width_ratio:
-            Assumed thickness to width ratio for the glacier [-]. Use 0.5 to have semicircular glacier cross-sections.
+            Assumed thickness to width ratio for the glacier [-]. Should be <0.5 to prevent gaps in the glaciers. Defaults to 0.25 (Liebl et al 2023).
         density_ice : float
-            Denisty of ice [M/L^3]. Defaults to 920 kg/m^3.
+            Denisty of ice [kg/m^3]. Defaults to 920 kg/m^3.
         grav_accel : float
-            Gravitation acceleration [L/T^2]. Defaults to 10 m/s^2.
+            Gravitation acceleration [m/s^2]. Defaults to 9.8 m/s^2.
         glen_exp : float
             Glen-Nye flow law exponent. Defaults to 3.
         erosion_exp : float
             Basal velocity to erosion rate power law exponent. Defaults to 2.
         erosion_const : float
-            Basal velocity to erosion rate proportionality constant (units vary depending on the value of erosion_exp). Defaults to 2.5*10**(-6) (Braedstrup et al., 2016).
+            Basal velocity to erosion rate proportionality constant (units vary depending on the value of erosion_exp). Defaults to 2.5*10**(-6) a/m (Braedstrup et al., 2016).
         glen_const : float
-            Glen-Nye flow law proportionality constant (units vary depending on the value of glen_exp). Defaults to 24*10**(-25) (Budd & Jacka 1989, Cuffey & Patterson: The Physics of Glaciers).
+            Glen-Nye flow law proportionality constant (units vary depending on the value of glen_exp). Defaults to 24*10**(-25) s^-1 Pa^-3 (Budd & Jacka 1989, Cuffey & Patterson: The Physics of Glaciers).
         """
 
         super().__init__(grid)
@@ -213,7 +213,7 @@ class GlacialErosion(Component):
     def _glacier_width(self, node):
         ''' Calculates the empirical glacier width for a given node.
         '''
-        return self._width_scaling_const*(self._q[node]*self._grid.dx)**self._width_scaling_exp
+        return self._width_scaling_const*(self._ice_discharge[node]*self._grid.dx)**self._width_scaling_exp
     
     def _donors(self, node):
         '''List indices of nodes which flow into the target node, exept itself.
@@ -237,12 +237,12 @@ class GlacialErosion(Component):
                 node = donors[0]
             else: 
                 # Find the donor with largest flow:
-                largest_disch = self._q[donors[0]]
+                largest_disch = self._ice_discharge[donors[0]]
                 largest_donor = donors[0]
                 for donor in donors[1:]:
-                    if self._q[donor] > largest_disch:
+                    if self._ice_discharge[donor] > largest_disch:
                         largest_donor = donor
-                        largest_disch = self._q[donor]
+                        largest_disch = self._ice_discharge[donor]
                 cardinal_flowline.append(largest_donor)
                 node = largest_donor
                     
@@ -271,7 +271,7 @@ class GlacialErosion(Component):
         fa = FlowAccumulator(self._grid, flow_director="D8", runoff_rate=self._precipitation_rate_ice, depression_finder="DepressionFinderAndRouter")
         fa.run_one_step()
 
-        self._q = return_array_at_node(self._grid, "surface_water__discharge")
+        self._ice_discharge = return_array_at_node(self._grid, "surface_water__discharge")
         self._flow_receivers = self._grid.at_node["flow__receiver_node"]
         self._slope = self._grid.at_node["topographic__steepest_slope"]
     
@@ -296,7 +296,6 @@ class GlacialErosion(Component):
 
             B = -0.5*self._density_ice*self._grav_accel*_sinarctan(slope_along_flow)
             AB3 = self._glen_const*B**3
-            total_discharge = self._q[center_node]*self._grid.dx # Check met benjamin of _dx de juiste is, of dat link lengths niet beter is oid...
 
             if glacier_width/2 > self._grid.dx:
                 # Find which nodes belong to the swath
@@ -307,8 +306,8 @@ class GlacialErosion(Component):
                 swath_node_distances = [self._dist_two_nodes(center_node, node) for node in swath_node_ids]
                 swath_node_elevations = [self._grid.at_node["topographic__elevation"][node] for node in swath_node_ids]
 
-                swath_object = Swath(AB3, total_discharge, slope_along_flow, glacier_width, glacier_width*self._thickness_to_width_ratio, swath_node_ids, swath_node_elevations, swath_node_distances)
+                swath_object = Swath(AB3, self._ice_discharge[center_node]/SECPERYEAR, slope_along_flow, glacier_width, glacier_width*self._thickness_to_width_ratio, swath_node_ids, swath_node_elevations, swath_node_distances)
                 swath_object.find_basal_velocities()
 
                 for n, node in enumerate(swath_object.node_ids):
-                    self._update_ice_values(node, swath_object.basal_velocities[n], swath_object.ice_thicknesses[n], len(swath_object.node_ids))
+                    self._update_ice_values(node, swath_object.basal_velocities[n]*SECPERYEAR, swath_object.ice_thicknesses[n], len(swath_object.node_ids))
