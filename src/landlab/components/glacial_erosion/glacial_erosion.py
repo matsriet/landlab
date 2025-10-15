@@ -1,6 +1,7 @@
 from landlab import Component
 from landlab import RasterModelGrid
 from landlab.components import FlowAccumulator
+from landlab.components import PriorityFloodFlowRouter
 from landlab.utils.return_array import return_array_at_node
 import numpy as np
 
@@ -128,7 +129,7 @@ class GlacialErosion(Component):
         grid,
         equilibrium_line_altitude=None,
         full_ice_altitude=None,
-        precipitation_rate=1,
+        precipitation_rate=1.,
         width_scaling_exp=0.3,
         width_scaling_const=1, #150
         thickness_to_width_ratio=0.25,
@@ -268,7 +269,8 @@ class GlacialErosion(Component):
             ice_multiplier = (self._grid.at_node["topographic__elevation"] - self._equilibrium_line_altitude)/(self._full_ice_altitude - self._equilibrium_line_altitude)
             self._precipitation_rate_ice = self._precipitation_rate * ice_multiplier.clip(max=1)
 
-        fa = FlowAccumulator(self._grid, flow_director="D8", runoff_rate=self._precipitation_rate_ice, depression_finder="DepressionFinderAndRouter")
+        fa = FlowAccumulator(self._grid, flow_director="D8", runoff_rate=self._precipitation_rate_ice, depression_finder="DepressionFinderAndRouter") #"D8", "DepressionFinderAndRouter"
+        #fa = PriorityFloodFlowRouter(self._grid, runoff_rate=self._precipitation_rate_ice)
         fa.run_one_step()
 
         self._ice_discharge = return_array_at_node(self._grid, "surface_water__discharge")
@@ -280,22 +282,18 @@ class GlacialErosion(Component):
             self.sliding_velocities[node] = basal_velocity
             self.ice_thickness[node] = ice_thickness
             self.erosion_rate[node] = self._erosion_const * basal_velocity**self._erosion_exp
-            if number_of_nodes_in_swath > 1:
-                self.node_info_from_swath[node] = 1
+            self.number_of_nodes_in_swath[node] = number_of_nodes_in_swath
 
     def erosion_rate_ice(self):
-        self.sliding_velocities = [0]*self._grid.number_of_nodes
-        self.ice_thickness = [0]*self._grid.number_of_nodes
-        self.erosion_rate = [0]*self._grid.number_of_nodes
-        self.node_info_from_swath = [0]*self._grid.number_of_nodes
+        self.sliding_velocities = np.zeros(self._grid.number_of_nodes)
+        self.ice_thickness = np.zeros(self._grid.number_of_nodes)
+        self.erosion_rate = np.zeros(self._grid.number_of_nodes)
+        self.number_of_nodes_in_swath = np.zeros(self._grid.number_of_nodes)
 
         for center_node in range(self._grid.number_of_nodes):
             # Calculate glacier width and flow parameters
-            glacier_width = self._glacier_width(center_node)
+            glacier_width = self._glacier_width(center_node) # @Mats calculate using numpy instead
             slope_along_flow = max(self._slope[center_node], 0.0001) # Artifically set a lower bound to the slope to prevent it to become 0.
-
-            B = -0.5*self._density_ice*self._grav_accel*_sinarctan(slope_along_flow)
-            AB3 = self._glen_const*B**3
 
             if glacier_width/2 > self._grid.dx:
                 # Find which nodes belong to the swath
@@ -306,8 +304,17 @@ class GlacialErosion(Component):
                 swath_node_distances = [self._dist_two_nodes(center_node, node) for node in swath_node_ids]
                 swath_node_elevations = [self._grid.at_node["topographic__elevation"][node] for node in swath_node_ids]
 
+                B = -0.5*self._density_ice*self._grav_accel*_sinarctan(slope_along_flow)
+                AB3 = self._glen_const*B**3
                 swath_object = Swath(AB3, self._ice_discharge[center_node]/SECPERYEAR, slope_along_flow, glacier_width, glacier_width*self._thickness_to_width_ratio, swath_node_ids, swath_node_elevations, swath_node_distances)
                 swath_object.find_basal_velocities()
 
                 for n, node in enumerate(swath_object.node_ids):
                     self._update_ice_values(node, swath_object.basal_velocities[n]*SECPERYEAR, swath_object.ice_thicknesses[n], len(swath_object.node_ids))
+
+    def erode_topography(self, timestep_size=100, num_timesteps=5, flowroute_recalc_interval = 1):
+        for t in range(num_timesteps):
+            if t % flowroute_recalc_interval == 0 and t != 0:
+                self._determine_flow()
+            self.erosion_rate_ice()
+            self._grid.at_node["topographic__elevation"] -= self.erosion_rate*timestep_size
