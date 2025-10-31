@@ -54,8 +54,10 @@ class Swath():
         self.node_elevations = [j for i,j,k in sort_zip]
         self.node_ids = [k for i,j,k in sort_zip]
 
-        # Calculate ice thickness
-        self._obtain_ice_thicknesses()
+        # Calculate initial estimates for ice thickness, velocity at the glacier center and maximal radius
+        self.ice_thicknesses = [max(0, (self.ice_level - elev)*_cosarctan(self.slope_angle)) for elev in self.node_elevations]
+        self.velocity_0 = (self.discharge/(PI*2/3*(-1/self._AB3)**0.5))**(2/3) #The velocity at (0,0) which yeilds the discharge through a semicircular glacier with maximal radius.
+        self._max_allowed_radius()
     
     def _numerical_velocity_integration(self):
         # Divide the distance between center and rim of glacier (halfwidth) into buckets, by calculating the distance between midpoints between nodes
@@ -64,35 +66,42 @@ class Swath():
         else:
             self._bucket_widths = [self.width/2]
 
-        area_cross_sections = [self._bucket_widths[i]*self.ice_thicknesses[i] for i in range(len(self._bucket_widths))]
-        flows_cross_sections = [self._bucket_widths[i]*(1/5*self.ice_thicknesses[i]**5 + 2/3*self.ice_thicknesses[i]**3*self.node_distances[i]**2 + self.ice_thicknesses[i]*self.node_distances[i]**4) for i in range(len(self.node_distances))]
+        updated_ice_thicknesses = []
+        basal_velocities = []
+
+        for n, node in enumerate(self.node_ids):
+            if self.node_distances[n] > self.max_radius: #Case where nodes are completely outside the max allowed radius
+                updated_ice_thicknesses.append(0)
+                basal_velocities.append(0)
+            elif self.node_distances[n]**2 + self.ice_thicknesses[n]**2 > self.max_radius**2: #Case where node elevations are below the max allowed radius
+                updated_ice_thicknesses.append((self.max_radius**2 - self.node_distances[n]**2)**0.5)
+                basal_velocities.append(0)
+            else:
+                updated_ice_thicknesses.append(self.ice_thicknesses[n])
+                basal_velocities.append(1)
+
+        area_cross_sections = [self._bucket_widths[i]*updated_ice_thicknesses[i] for i in range(len(self._bucket_widths))]
+        flows_cross_sections = [self._bucket_widths[i]*(1/5*updated_ice_thicknesses[i]**5 + 2/3*updated_ice_thicknesses[i]**3*self.node_distances[i]**2 + updated_ice_thicknesses[i]*self.node_distances[i]**4) for i in range(len(self.node_distances))]
         
-        self.velocity_0 = (self.discharge - self._AB3/4*sum(flows_cross_sections)*2)/(sum(area_cross_sections)*2)
-        self.basal_velocities = [self._AB3/4*(self.ice_thicknesses[i]**2 + self.node_distances[i]**2)**2 + self.velocity_0 for i in range(len(self.node_distances))]
-
-    def _obtain_ice_thicknesses(self, max_radius=None):
-        original_ice_thicknesses = [max(0, (self.ice_level - elev)*_cosarctan(self.slope_angle)) for elev in self.node_elevations]
-
-        if max_radius == None:
-            self.ice_thicknesses = original_ice_thicknesses
+        if sum(area_cross_sections) !=0:
+            self.velocity_0 = (self.discharge - self._AB3/4*sum(flows_cross_sections)*2)/(sum(area_cross_sections)*2)
+            self.basal_velocities = [basal_velocities[i]*(self._AB3/4*(updated_ice_thicknesses[i]**2 + self.node_distances[i]**2)**2 + self.velocity_0) for i in range(len(self.node_distances))]
         else:
-            self.ice_thicknesses = [min(original_ice_thicknesses[i], (max_radius**2 - self.node_distances[i]**2)**0.5) for i in range(len(self.node_distances))]
-
+            self.velocity_0 = 0
+            self.basal_velocities = [0]*len(self.node_ids)
+        return updated_ice_thicknesses
+    
     def _max_allowed_radius(self):
-        max_radius = (-4*self.velocity_0/self._AB3)**0.25
-        return max_radius
+        self.max_radius = (-4*self.velocity_0/self._AB3)**0.25
     
     def find_basal_velocities(self):
         radii = [(self.ice_thicknesses[i]**2 + self.node_distances[i]**2)**0.5 for i in range(len(self.node_distances))]
-        self.velocity_0 = (self.discharge/(PI*2/3*(-1/self._AB3)**0.5))**(2/3) #The velocity at (0,0) which yeilds the discharge through a semicircular glacier with maximal radius.
 
-        max_radius = self._max_allowed_radius()
-
-        if max(radii) <= max_radius:
+        if max(radii) <= self.max_radius:
             # Directly numerically integrate to obtain basal velocities.
             self._numerical_velocity_integration()
 
-        elif min(radii) >= max_radius:
+        elif min(radii) >= self.max_radius:
             # Bedrock surface is completely outside of the (positive) flow of the glacier, therefore basal velocities are zero.
             self.basal_velocities = [0]*len(self.node_ids)
 
@@ -101,13 +110,13 @@ class Swath():
             # Here, iteratively calculate velocities such that the total discharge is solved but there are no nonnegative velocities.
             for i in range(self.iteration_attempts):
                 # This is done by setting the ice_thicknesses to have radii at most at the radius where velocity = 0, then numerically integrating the velocities. 
-                self._obtain_ice_thicknesses(max_radius)
-                self._numerical_velocity_integration()
+                updated_ice_thicknesses = self._numerical_velocity_integration()
                 # This yields a u_0 larger than before, which means the max radius increases. Repeat until u_0 is stable.
                 if abs(previous_velocity_0 - self.velocity_0) <= self.velocity_error_margin:
+                    self.ice_thicknesses = updated_ice_thicknesses
                     break
                 else:
-                    max_radius = self._max_allowed_radius()
+                    self._max_allowed_radius()
                     previous_velocity_0 = self.velocity_0
 
             if i == self.iteration_attempts - 1:
@@ -181,12 +190,7 @@ class GlacialErosion(Component):
             self._link_lengths = grid.length_of_link
 
         if isinstance(precipitation_rate, (int, float)):
-            precipitation_rate = np.full(grid.number_of_nodes, precipitation_rate)
-
-        self._precipitation_rate = precipitation_rate
-        self._equilibrium_line_altitude = equilibrium_line_altitude
-        self._full_ice_altitude = full_ice_altitude
-        self._determine_flow()  
+            precipitation_rate = np.full(grid.number_of_nodes, precipitation_rate, dtype=np.float64)
 
         self._width_scaling_exp = width_scaling_exp
         self._width_scaling_const = width_scaling_const
@@ -198,6 +202,11 @@ class GlacialErosion(Component):
         self._erosion_const = erosion_const
         self._glen_const = glen_const
 
+        self._precipitation_rate = precipitation_rate
+        self._equilibrium_line_altitude = equilibrium_line_altitude
+        self._full_ice_altitude = full_ice_altitude
+        self._determine_flow()
+        
     def _dist_two_nodes(self, node1, node2):
         '''Calculate the horizontal euclidian distance between two nodes on the modelgrid.
         node1 : int
@@ -211,11 +220,6 @@ class GlacialErosion(Component):
             distance = ((self._grid.node_x[node1] - self._grid.node_x[node2])**2 + (self._grid.node_y[node1] - self._grid.node_y[node2])**2)**0.5
         return distance
     
-    def _glacier_width(self, node):
-        ''' Calculates the empirical glacier width for a given node.
-        '''
-        return self._width_scaling_const*(self._ice_discharge[node]*self._grid.dx)**self._width_scaling_exp
-    
     def _donors(self, node):
         '''List indices of nodes which flow into the target node, exept itself.
         '''
@@ -224,9 +228,7 @@ class GlacialErosion(Component):
     def _cardinal_flowline(self, node):
         '''Find the cardinal flow line for the node (series of largest donors leading to the node)
         '''
-
-        # @Mats stop at a certain distance to save on number of computations?
-
+        original_node = node
         cardinal_flowline = [node]
         end = False
         while not end:
@@ -246,6 +248,9 @@ class GlacialErosion(Component):
                         largest_disch = self._ice_discharge[donor]
                 cardinal_flowline.append(largest_donor)
                 node = largest_donor
+
+            if self._dist_two_nodes(original_node, node):
+                end = True
                     
         return cardinal_flowline
     
@@ -276,6 +281,7 @@ class GlacialErosion(Component):
         self._ice_discharge = return_array_at_node(self._grid, "surface_water__discharge")
         self._flow_receivers = self._grid.at_node["flow__receiver_node"]
         self._slope = self._grid.at_node["topographic__steepest_slope"]
+        self._glacier_width = self._width_scaling_const*(self._ice_discharge*self._grid.dx)**self._width_scaling_exp
     
     def _update_ice_values(self, node, basal_velocity, ice_thickness, number_of_nodes_in_swath):
         if basal_velocity > self.sliding_velocities[node]:
@@ -292,13 +298,12 @@ class GlacialErosion(Component):
 
         for center_node in range(self._grid.number_of_nodes):
             # Calculate glacier width and flow parameters
-            glacier_width = self._glacier_width(center_node) # @Mats calculate using numpy instead
-            slope_along_flow = max(self._slope[center_node], 0.0001) # Artifically set a lower bound to the slope to prevent it to become 0.
+            slope_along_flow = max(self._slope[center_node], 0.0001) # Artifically set a lower bound to the slope to prevent it from becoming 0, which breaks equations in the swath routine.
 
-            if glacier_width/2 > self._grid.dx:
+            if self._glacier_width[center_node]/2 > self._grid.dx:
                 # Find which nodes belong to the swath
                 cardinal_flowline = self._cardinal_flowline(center_node)
-                donor_indices = self._donors_in_swath(center_node, center_node, cardinal_flowline, glacier_width)
+                donor_indices = self._donors_in_swath(center_node, center_node, cardinal_flowline, self._glacier_width[center_node])
 
                 swath_node_ids = [center_node] + donor_indices
                 swath_node_distances = [self._dist_two_nodes(center_node, node) for node in swath_node_ids]
@@ -306,7 +311,7 @@ class GlacialErosion(Component):
 
                 B = -0.5*self._density_ice*self._grav_accel*_sinarctan(slope_along_flow)
                 AB3 = self._glen_const*B**3
-                swath_object = Swath(AB3, self._ice_discharge[center_node]/SECPERYEAR, slope_along_flow, glacier_width, glacier_width*self._thickness_to_width_ratio, swath_node_ids, swath_node_elevations, swath_node_distances)
+                swath_object = Swath(AB3, self._ice_discharge[center_node]/SECPERYEAR, slope_along_flow, self._glacier_width[center_node], self._glacier_width[center_node]*self._thickness_to_width_ratio, swath_node_ids, swath_node_elevations, swath_node_distances)
                 swath_object.find_basal_velocities()
 
                 for n, node in enumerate(swath_object.node_ids):
@@ -314,7 +319,7 @@ class GlacialErosion(Component):
 
     def erode_topography(self, timestep_size=100, num_timesteps=5, flowroute_recalc_interval = 1):
         for t in range(num_timesteps):
-            if t % flowroute_recalc_interval == 0 and t != 0:
+            if t % flowroute_recalc_interval == 0:
                 self._determine_flow()
             self.erosion_rate_ice()
             self._grid.at_node["topographic__elevation"] -= self.erosion_rate*timestep_size
