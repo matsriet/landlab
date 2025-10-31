@@ -279,9 +279,15 @@ class GlacialErosion(Component):
         fa.run_one_step()
 
         self._ice_discharge = return_array_at_node(self._grid, "surface_water__discharge")
+        _ = self._grid.add_field('surface_ice__discharge', self._ice_discharge, at='node', clobber=True)
+
+        #Remove surface_water__discharge field or run flowrouter again
+        
         self._flow_receivers = self._grid.at_node["flow__receiver_node"]
         self._slope = self._grid.at_node["topographic__steepest_slope"]
+
         self._glacier_width = self._width_scaling_const*(self._ice_discharge*self._grid.dx)**self._width_scaling_exp
+        _ = self._grid.add_field('glacier__width', self._glacier_width, clobber=True)
     
     def _update_ice_values(self, node, basal_velocity, ice_thickness, number_of_nodes_in_swath):
         if basal_velocity > self.sliding_velocities[node]:
@@ -316,6 +322,11 @@ class GlacialErosion(Component):
 
                 for n, node in enumerate(swath_object.node_ids):
                     self._update_ice_values(node, swath_object.basal_velocities[n]*SECPERYEAR, swath_object.ice_thicknesses[n], len(swath_object.node_ids))
+
+                _ = self._grid.add_field('ice__sliding_velocity', self.sliding_velocities, clobber=True)
+                _ = self._grid.add_field('ice__thickness', self.ice_thickness, clobber=True)
+                _ = self._grid.add_field('ice__erosion_rate', self.erosion_rate, clobber=True)
+                _ = self._grid.add_field('glacier__swath_number_of_nodes', self.number_of_nodes_in_swath, clobber=True)
 
     def erode_topography(self, timestep_size=100, num_timesteps=5, flowroute_recalc_interval = 1):
         for t in range(num_timesteps):
