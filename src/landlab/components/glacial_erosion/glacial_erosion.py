@@ -172,11 +172,14 @@ class GlacialErosion(Component):
                     
         return cardinal_flowline
     
-    def _donors_in_swath(self, node, original_node, width_swath, use_flow_network=True, excluded_nodes=[]):
+    def _donors_in_swath(self, node, original_node, width_swath, use_flow_network=True, excluded_nodes=None):
         """Finds the donors of a node and the donors of those donors. 
         Stops at a donor that is in the excluded nodes list or is outside the glacier width.
         Uses BFS with a deque."""
         
+        if excluded_nodes is None:
+            excluded_nodes = []
+
         if use_flow_network == True:
             swath = []
             visited = set(excluded_nodes)  # Track visited nodes to avoid duplicates or nodes in the excluded list
@@ -213,10 +216,11 @@ class GlacialErosion(Component):
         fa = PriorityFloodFlowRouter(self._grid, runoff_rate=self._precipitation_rate_ice)
         fa.run_one_step()
 
-        ice_discharge = return_array_at_node(self._grid, "surface_water__discharge")
+        ice_discharge = np.maximum(return_array_at_node(self._grid, "surface_water__discharge"),0)
         _ = self._grid.add_field('ice__discharge', ice_discharge, at='node', clobber=True)
 
-        #To do: Remove surface_water__discharge field or run flowrouter again
+        #To do: Remove the temporary surface_water__discharge field to avoid confusion
+        #To do: Run flowrouter again with precipitation of water? 
 
         glacier_width = self._width_scaling_const*(ice_discharge*self._grid.dx)**self._width_scaling_exp
         _ = self._grid.add_field('glacier__width', glacier_width, clobber=True)
@@ -250,14 +254,14 @@ class GlacialErosion(Component):
         _ = self._grid.add_field('glacier__swath_number_of_nodes', swaths_number_of_nodes, clobber=True)
 
     def calc_ice_thicknesses(self):
-        ice_elevation = np.zeros(self._grid.number_of_nodes)
+        ice_elevation = np.full(self._grid.number_of_nodes, -np.inf)
 
         topography = self._grid.at_node["topographic__elevation"]
         glacier_width = self._grid.at_node['glacier__width']
 
         for swath in self.swaths:
             center_ice_level = topography[swath[0]] + glacier_width[swath[0]]*self._thickness_to_width_ratio
-            ice_elevation[swath] = np.maximum(ice_elevation[swath], center_ice_level, topography[swath])
+            ice_elevation[swath] = np.maximum(np.maximum(ice_elevation[swath], topography[swath]), center_ice_level)
 
         _ = self._grid.add_field('ice__elevation', ice_elevation, clobber=True)
         _ = self._grid.add_field('ice__thickness', ice_elevation - topography, clobber=True)
@@ -275,12 +279,17 @@ class GlacialErosion(Component):
         cos_correction = _cosarctan(slope)
 
         swath = self.swaths[center_node]
-        distances = [self._dist_two_nodes(center_node, node) for node in swath]
+        
+        #Calculate distances accross the swath
+        swath_array = np.array(swath)
+        dx = self._grid.node_x[swath_array] - self._grid.node_x[center_node]
+        dy = self._grid.node_y[swath_array] - self._grid.node_y[center_node]
+        distances = np.sqrt(dx**2 + dy**2)
 
-        #Sort the swath from smalles to largest distance
-        sort_zip = sorted(zip(distances, swath))
-        distances = [i for i,j in sort_zip]
-        swath = [j for i,j in sort_zip]
+        # Sort swath by distance
+        sort_indices = np.argsort(distances)
+        distances = distances[sort_indices]
+        swath = swath_array[sort_indices]
 
         #Obtain ice and topography elevations
         center_ice_surface = self._grid.at_node["ice__elevation"][center_node]
@@ -288,19 +297,20 @@ class GlacialErosion(Component):
         ice_surface_elevations = self._grid.at_node["ice__elevation"][swath]
 
         if constant_ice_level == True:
-            ice_surface_elevations[:] = center_ice_surface
+            ice_surface_elevations = np.full_like(ice_surface_elevations, center_ice_surface)
 
         # Divide the distance between center and rim of glacier (halfwidth) into buckets, by calculating the distance between midpoints between nodes
         if len(swath) > 1:
-            bucket_widths = [distances[1]/2] + [(distances[i+1] - distances[i-1])/2 for i in range(1, len(distances) - 1)] + [(distances[-1] - distances[-2])/2 + width/2 - distances[-1]]
+            bucket_widths = np.zeros(len(distances))
+            bucket_widths[0] = distances[1] / 2
+            bucket_widths[1:-1] = (distances[2:] - distances[:-2]) / 2
+            bucket_widths[-1] = (distances[-1] - distances[-2]) / 2 + width / 2 - distances[-1]
         else:
-            bucket_widths = [width/2]
+            bucket_widths = np.array([width / 2])
 
-        bucket_widths = np.array(bucket_widths)
-        distances = np.array(distances)
-        max_radius = _max_radius(discharge, AB3)
-
+        
         #Where ice extends below the max range, set to the max range
+        max_radius = _max_radius(discharge, AB3)
         max_thickness_below = max_radius**2 - np.square(distances) 
 
         thicknesses_above_center = np.clip((ice_surface_elevations - center_ice_surface)*cos_correction, a_min=0, a_max=None)
@@ -308,24 +318,28 @@ class GlacialErosion(Component):
         ice_bottom_below_center = np.clip((center_ice_surface - topography_elevations)*cos_correction, a_min=0, a_max=max_thickness_below)
 
         #Where nodes are completely outside the max allowed radius (further horizontally), thicknesses should be set to 0.
-        nodes_outside_range = np.where(distances > width/2)
-        thicknesses_above_center[nodes_outside_range] = 0
-        ice_top_below_center[nodes_outside_range] = 0
-        ice_bottom_below_center[nodes_outside_range] = 0
+        outside_range = distances > width/2
+        thicknesses_above_center[outside_range] = 0
+        ice_top_below_center[outside_range] = 0
+        ice_bottom_below_center[outside_range] = 0
 
         area_cross_section = np.sum(bucket_widths*(ice_bottom_below_center - ice_top_below_center + thicknesses_above_center))
         
-        #Ice above the center line moves at the same rate as the surface (without deformation), integrated separately
-        flow_below_center = np.sum(bucket_widths*(1/5*(ice_bottom_below_center**5 - ice_top_below_center**5) + 2/3*distances**2*(ice_bottom_below_center**3 - ice_top_below_center**3) + distances**4*(ice_bottom_below_center - ice_top_below_center)))
-        flow_above_center = np.sum(bucket_widths*thicknesses_above_center*distances**4)
-        flow = flow_below_center + flow_above_center
-
         if area_cross_section !=0:
+            #Ice above the center line is assumed to move at the same rate as the surface (without deformation), integrated separately
+            flow_below_center = np.sum(bucket_widths*(
+                1/5 * (ice_bottom_below_center**5 - ice_top_below_center**5) + 
+                2/3 * distances**2 * (ice_bottom_below_center**3 - ice_top_below_center**3) + 
+                distances**4 * (ice_bottom_below_center - ice_top_below_center)
+                ))
+            flow_above_center = np.sum(bucket_widths*thicknesses_above_center*distances**4)
+            flow = flow_below_center + flow_above_center
+
             velocity_0 = (discharge - AB3/4*flow*2)/(area_cross_section*2)
             basal_velocities = AB3/4*((ice_bottom_below_center**2 + distances**2)**2) + velocity_0
-            basal_velocities[nodes_outside_range] = 0
+            basal_velocities[outside_range] = 0
         else:
-            basal_velocities = np.zeros_like(swath)
+            basal_velocities = np.zeros(len(swath))
 
         return swath, basal_velocities
 
