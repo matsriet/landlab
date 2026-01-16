@@ -54,12 +54,14 @@ class GlacialErosion(Component):
         equilibrium_line_altitude=None,
         full_ice_altitude=None,
         precipitation_rate=1.,
+        nonlinear_mass_balance=False,
+        melt_rate_scaling_factor=1,
         width_scaling_exp=0.3,
-        width_scaling_const=1, #150
+        width_scaling_const=1,
         thickness_to_width_ratio=0.25,
         density_ice=920,
         grav_accel = 9.8,
-        glen_exp = 3, #Not used at the moment, hardcoded. See if solutions to differential equations can handle varying this.
+        glen_exp = 3, #Not used at the moment, hardcoded, equations need updating.
         erosion_exp = 2,
         erosion_const = 2.5*10**(-6),
         glen_const = 24*10**(-25),
@@ -71,12 +73,16 @@ class GlacialErosion(Component):
         ----------
         grid : ModelGrid
             Landlab ModelGrid object
+        equilibrium_line_altitude : float or None
+            Elevation of the equilibrium line, where ice accumulation == ablation [m]. If set to the standard value of None, assumes that all precipitation is converted to ice.
+        full_ice_altitude : float or None
+            Elevation of the line where all precipitation is converted to ice [m]. If set to the standard value of None, assumes that all precipitation is converted to ice.
         precipitation_rate : array or float
             Rate of precipitation [m/a].
-        equilibrium_line_altitude : float
-            Elevation of the equilibrium line, where ice accumulation == ablation [m]. If set to the standard value of None, assumes that all precipitation is converted to ice.
-        full_ice_altitude : float
-            Elevation of the line where all precipitation is converted to ice [m]. If set to the standard value of None, assumes that all precipitation is converted to ice.
+        nonlinear_mass_balance : bool
+            Whether to use the nonlinear mass balance model by Liebl et al. (2023). If set to False, uses the linear model by Hergarten (2021). For a comparison, see the Liebl et al. (2023) paper. 
+        melt_rate_scaling_factor : float
+            Scaling factor for adjusting the mass balance below the ELA. Set to values > 1 for faster melt and < 1 for slower melt.
         width_scaling_exp : float
             Discharge to glacier width power law exponent. Defaults to 0.3 (Hergarten, 2021).
         width_scaling_const: 
@@ -120,6 +126,8 @@ class GlacialErosion(Component):
         self._precipitation_rate = precipitation_rate
         self._equilibrium_line_altitude = equilibrium_line_altitude
         self._full_ice_altitude = full_ice_altitude
+        self._nonlinear_mass_balance = nonlinear_mass_balance
+        self._melt_rate_scaling_factor = melt_rate_scaling_factor
         self._determine_flow()
         
     def _dist_two_nodes(self, node1, node2):
@@ -208,20 +216,38 @@ class GlacialErosion(Component):
     
     def _determine_flow(self):
         if self._equilibrium_line_altitude == None or self._full_ice_altitude == None:
+            # All precipitation is converted to ice
             self._precipitation_rate_ice = self._precipitation_rate
         else:
-            ice_multiplier = (self._grid.at_node["topographic__elevation"] - self._equilibrium_line_altitude)/(self._full_ice_altitude - self._equilibrium_line_altitude)
+            # Precipitation is converted to ice according to the mass balance model used
+            elevation = self._grid.at_node["topographic__elevation"]
+            ela = self._equilibrium_line_altitude
+            fia = self._full_ice_altitude
+            ice_multiplier = (elevation - ela) / (fia - ela)
+            
+            below_ela = elevation < ela
+            # Apply nonlinear mass balance model, if defined by the parameter
+            if self._nonlinear_mass_balance == True:
+                fraction = (ela - elevation[below_ela])/(fia - ela)
+                ice_multiplier[below_ela] = -fraction - 1/3*fraction**2
+            
+            # Adjust melt rate according to scaling factor
+            ice_multiplier[below_ela] = ice_multiplier[below_ela]*self._melt_rate_scaling_factor
+
             self._precipitation_rate_ice = self._precipitation_rate * ice_multiplier.clip(max=1)
 
+        # Run flow routing using ice precipitation
         fa = PriorityFloodFlowRouter(self._grid, runoff_rate=self._precipitation_rate_ice)
         fa.run_one_step()
 
+        # Calculate ice discharge along cardinal flow line
         ice_discharge = np.maximum(return_array_at_node(self._grid, "surface_water__discharge"),0)
         _ = self._grid.add_field('ice__discharge', ice_discharge, at='node', clobber=True)
 
         #To do: Remove the temporary surface_water__discharge field to avoid confusion
         #To do: Run flowrouter again with precipitation of water? 
 
+        # Calculate glacier width
         glacier_width = self._width_scaling_const*(ice_discharge*self._grid.dx)**self._width_scaling_exp
         _ = self._grid.add_field('glacier__width', glacier_width, clobber=True)
 
@@ -266,7 +292,7 @@ class GlacialErosion(Component):
         _ = self._grid.add_field('ice__elevation', ice_elevation, clobber=True)
         _ = self._grid.add_field('ice__thickness', ice_elevation - topography, clobber=True)
 
-        #Take the average slope for the ice claculations, as using the maximum slope does not produce U-shaped valleys
+        #Take the average slope for the ice claculations, as using the maximum slope does not produce U-shaped valleys.
         ice_slope = self._grid.calc_slope_at_node(elevs='topographic__elevation')
         _ = self._grid.add_field('ice__slope', ice_slope, clobber=True)
 
