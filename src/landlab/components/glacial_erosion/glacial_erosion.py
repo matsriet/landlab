@@ -19,23 +19,10 @@ def _sinarctan(slope):
     '''
     return slope/((1 + slope**2)**0.5)
 
-def _circular_velocity_0(discharge, AB3):
-    ''' Calculates the velocity at (0,0) which satisfies the discharge through a semicircular glacier where vel=0 at the circumference.
+def _max_radius(discharge, AB3):
+    ''' Calculates for a given discharge the radius at which a semicircular glacier would have 0 velocity.
     '''
-    return (discharge/(PI*2/3*(-1/AB3)**0.5))**(2/3)
-
-def _max_radius(discharge, AB3, velocity_0=None):
-    if velocity_0 == None:
-        velocity_0 = _circular_velocity_0(discharge, AB3)
-    return (-4*velocity_0/AB3)**0.25
-
-def _clamp(value, lower_bound, upper_bound):
-    ''' Limits the of  value to one between lower and upper bounds.
-    '''
-    if upper_bound < lower_bound:
-        print('_clamp function got an upper_bound that is lower than lower_bound. Reversing inputs...')
-        upper_bound, lower_bound = lower_bound, upper_bound
-    return max(lower_bound, min(upper_bound, value))
+    return (discharge*12/(PI*abs(AB3)))**(1/6)
 
 class GlacialErosion(Component):
     """
@@ -158,7 +145,7 @@ class GlacialErosion(Component):
         '''Cache the largest donor for each node. If there are no donors, the node itself is recorded, like receivers in flowrouting. Requires _build_donor_dict to have been called.'''
         # Initialize largest_donor to node itself. If there are no donors, the donor is the node itself.
         self._largest_donor = np.arange(self._grid.number_of_nodes, dtype=int)
-        discharge = self._grid.at_node["ice__discharge"]
+        discharge = self._grid.at_node["glacier__discharge"]
         
         for node, donors in self._donor_dict.items():
             if len(donors) > 0:
@@ -248,22 +235,26 @@ class GlacialErosion(Component):
         fa.run_one_step()
 
         if self._discharge_override is not None:
-            ice_discharge = self._discharge_override
+            glacier_discharge = self._discharge_override
         else:
             # Calculate ice discharge along cardinal flow line
-            ice_discharge = np.maximum(return_array_at_node(self._grid, "surface_water__discharge"),0)
+            glacier_discharge = np.maximum(return_array_at_node(self._grid, "surface_water__discharge"),0)
 
-        _ = self._grid.add_field('ice__discharge', ice_discharge, at='node', clobber=True)
+        _ = self._grid.add_field('glacier__discharge', glacier_discharge, at='node', clobber=True)
 
         #To do: Remove the temporary surface_water__discharge field to avoid confusion
         #To do: Run flowrouter again with precipitation of water? 
 
         # Calculate glacier width
-        glacier_width = self._width_scaling_const*(ice_discharge*self._grid.dx)**self._width_scaling_exp
+        glacier_width = self._width_scaling_const*(glacier_discharge*self._grid.dx)**self._width_scaling_exp
         _ = self._grid.add_field('glacier__width', glacier_width, clobber=True)
+
 
         self._build_donor_dict()  # Pre-compute donor relationships
         self._obtain_largest_donors() #Pre-compute largest donors for every node
+        self._calc_flow_directions() #Pre-compute flow directions and slope
+        self.calc_swaths()
+        self.calc_ice_thicknesses()
     
     def calc_swaths(self, use_flow_network=False, exclude_cardinal_nodes=False):
         self.swaths = []
@@ -290,98 +281,175 @@ class GlacialErosion(Component):
 
         _ = self._grid.add_field('glacier__swath_number_of_nodes', swaths_number_of_nodes, clobber=True)
 
+    def _calc_flow_directions(self):
+        """Calculate 2D flow direction components and slopes for all nodes.
+        Computed from the distances between upstream and downstream edge nodes of the swath.
+        Stores results as grid fields.
+        """
+        # Initialize arrays
+        num_nodes = self._grid.number_of_nodes
+        flow_x_normalized = np.zeros(num_nodes)
+        flow_y_normalized = np.zeros(num_nodes)
+        slope = np.zeros(num_nodes)
+        elevations = self._grid.at_node["topographic__elevation"]
+        receivers = self._grid.at_node["flow__receiver_node"]
+        
+        for center_node in range(num_nodes):
+            width = self._grid.at_node['glacier__width'][center_node]
+            
+            # Find upstream edge: follow largest donors until outside swath width
+            upstream_node = center_node
+            max_distance = width / 2
+            
+            while True:
+                largest_donor = self._largest_donor[upstream_node]
+                
+                if largest_donor == upstream_node:  # No more donors
+                    break
+                
+                dist = self._dist_two_nodes(center_node, largest_donor)
+                
+                if dist > max_distance:  # Outside swath
+                    break
+                
+                upstream_node = largest_donor
+            
+            # Find downstream edge: follow receivers until outside swath width
+            downstream_node = center_node
+            
+            while True:
+                receiver = receivers[downstream_node]
+                
+                if receiver == downstream_node:  # No more receivers
+                    break
+                
+                dist = self._dist_two_nodes(center_node, receiver)
+                
+                if dist > max_distance:  # Outside swath
+                    break
+                
+                downstream_node = receiver
+            
+            # Calculate flow vectors (downstream - upstream)
+            flow_x = self._grid.node_x[downstream_node] - self._grid.node_x[upstream_node]
+            flow_y = self._grid.node_y[downstream_node] - self._grid.node_y[upstream_node]
+            
+            # Calculate elevation change
+            delta_z = elevations[downstream_node] - elevations[upstream_node]
+            
+            # Calculate horizontal distance
+            delta_d = np.sqrt(flow_x**2 + flow_y**2)
+            
+            # Normalize and calculate slope
+            if delta_d > 0:
+                flow_x_normalized[center_node] = flow_x / delta_d
+                flow_y_normalized[center_node] = flow_y / delta_d
+                slope[center_node] = abs(delta_z / delta_d)
+            else:
+                # If upstream and downstream are the same node, use zero values
+                flow_x_normalized[center_node] = 0.0
+                flow_y_normalized[center_node] = 0.0
+                slope[center_node] = 0.0
+        
+        # Store as grid fields
+        self._grid.add_field('glacier__flow_direction_x', flow_x_normalized, clobber=True)
+        self._grid.add_field('glacier__flow_direction_y', flow_y_normalized, clobber=True)
+        self._grid.add_field('glacier__slope', slope, clobber=True)
+    
     def calc_ice_thicknesses(self):
-        ice_elevation = np.full(self._grid.number_of_nodes, -np.inf)
-
         topography = self._grid.at_node["topographic__elevation"]
-        glacier_width = self._grid.at_node['glacier__width']
+        ice_elevation = topography.copy()
 
         for swath in self.swaths:
-            center_ice_level = topography[swath[0]] + glacier_width[swath[0]]*self._thickness_to_width_ratio
-            ice_elevation[swath] = np.maximum(np.maximum(ice_elevation[swath], topography[swath]), center_ice_level)
+            center_node = swath[0]
+            slope = self._grid.at_node['glacier__slope'][center_node]
+            cos_correction = _cosarctan(slope)
+            width = self._grid.at_node['glacier__width'][center_node]
+            flow_x = self._grid.at_node['glacier__flow_direction_x'][center_node]
+            flow_y = self._grid.at_node['glacier__flow_direction_y'][center_node]
+            
+            #Calculate distances along flow
+            swath_array = np.array(swath)
+            dx = self._grid.node_x[swath_array] - self._grid.node_x[center_node]
+            dy = self._grid.node_y[swath_array] - self._grid.node_y[center_node]
+            distances_along = flow_x*dx + flow_y*dy
+
+            #Obtain ice elevations
+            center_ice_thickness_perpendicular = width*self._thickness_to_width_ratio
+            center_ice_thickness_vertical = center_ice_thickness_perpendicular/cos_correction
+            center_ice_level = topography[center_node] + center_ice_thickness_vertical
+            ice_surface_elevations = -slope * distances_along + center_ice_level
+
+            #Update ice elevation if the newly calculated ones are higher
+            ice_elevation[swath_array] = np.maximum(ice_surface_elevations, ice_elevation[swath_array])
 
         _ = self._grid.add_field('ice__elevation', ice_elevation, clobber=True)
         _ = self._grid.add_field('ice__thickness', ice_elevation - topography, clobber=True)
 
-        #Take the average slope for the ice claculations, as using the maximum slope does not produce U-shaped valleys.
-        ice_slope = self._grid.calc_slope_at_node(elevs='topographic__elevation')
-        _ = self._grid.add_field('ice__slope', ice_slope, clobber=True)
 
-    def flow_vector(self, node):
-        #Calculate flow vector, calculated from the distances between largest donor and receiver of the target node. Returns zeroes if neither exist.
-        receiver = self._grid.at_node["flow__receiver_node"][node]
-        donor = self._largest_donor[node]
-
-        if donor == node and receiver == node: #Node has no donor and receiver, therefore there is no flow.
-            flow_x = 0
-            flow_y = 0
-        else:
-            flow_x = self._grid.node_x[receiver] - self._grid.node_x[donor]
-            flow_y = self._grid.node_y[receiver] - self._grid.node_y[donor]
-
-            #Normalise
-            flow_length = (flow_x**2 + flow_y**2)**0.5
-            flow_x = flow_x/flow_length
-            flow_y = flow_y/flow_length
-
-        return flow_x, flow_y
-
-
-    def dir_cross_section_integration(self, center_node, constant_ice_level=False):
-        slope = _clamp(self._grid.at_node['ice__slope'][center_node], 0.0001, 1)
+    def dir_cross_section_integration(self, center_node, thickness_agnostic=False):
         width = self._grid.at_node['glacier__width'][center_node]
-        discharge = self._grid.at_node['ice__discharge'][center_node]/SECPERYEAR
+        discharge = self._grid.at_node['glacier__discharge'][center_node]/SECPERYEAR
+        swath = self.swaths[center_node]
+
+        #Obtain flow direction and slope
+        flow_x = self._grid.at_node['glacier__flow_direction_x'][center_node]
+        flow_y = self._grid.at_node['glacier__flow_direction_y'][center_node]
+        slope = self._grid.at_node['glacier__slope'][center_node]
+        #slope = _clamp(abs(slope), 0.0001, 1)
+
+        if flow_x == 0 and flow_y ==0: #No flow, therefore no velocities.
+            return swath, np.zeros(len(swath)), np.zeros(len(swath)), 0
+        
         B = -0.5*self._density_ice*self._grav_accel*_sinarctan(slope)
         AB3 = self._glen_const*B**3
         cos_correction = _cosarctan(slope)
-        swath = self.swaths[center_node]
-
-        #Obtain flow vector
-        flow_x, flow_y = self.flow_vector(center_node)
-        
-        if flow_x == 0 and flow_y ==0: #No flow, therefore no velocities.
-            return swath, np.zeros(len(swath)), np.zeros(len(swath)), 0
 
         #Calculate distances along and perpendicular to flow
         swath_array = np.array(swath)
         dx = self._grid.node_x[swath_array] - self._grid.node_x[center_node]
         dy = self._grid.node_y[swath_array] - self._grid.node_y[center_node]
-        d = (dx**2 + dy**2)**0.5
-        d_along = flow_x*dx + flow_y*dy
-        d_perp = flow_y*dx - flow_x*dy
+        distances = (dx**2 + dy**2)**0.5
+        distances_along = flow_x*dx + flow_y*dy
+        distances_perp = flow_y*dx - flow_x*dy
         
-        #Obtain ice and topography elevations
-        center_ice_surface = self._grid.at_node["ice__elevation"][center_node]
+        #Obtain topography and ice elevations
         topography_elevations = self._grid.at_node["topographic__elevation"][swath_array]
         ice_surface_elevations = self._grid.at_node["ice__elevation"][swath_array]
+        center_ice_elevation = self._grid.at_node["ice__elevation"][center_node]
+        reference_ice_elevation = -slope * distances_along + center_ice_elevation
 
-        if constant_ice_level == True:
-            ice_surface_elevations = np.full_like(ice_surface_elevations, center_ice_surface)
+        if thickness_agnostic == True:
+            # Calculate ice thicknesses purely according to the center node
+            center_ice_thickness_perpendicular = width*self._thickness_to_width_ratio
+            center_ice_thickness_vertical = center_ice_thickness_perpendicular/cos_correction
+            center_ice_elevation = self._grid.at_node["topographic__elevation"][center_node] + center_ice_thickness_vertical
+            reference_ice_elevation = -slope * distances_along + center_ice_elevation
+            ice_surface_elevations = reference_ice_elevation
 
         # --- Binning by perpendicular distance ---
-        # To determine glacier cross section, we use inverse along-distance weighting to calculate average elevations in the swath.
+        # To determine glacier cross section, we use inverse along-distance weighting to calculate average topographic elevations in the swath.
 
         # First find unique perpendicular distances, used as natural bins (grid-aligned)
-        unique_d_perp = np.unique(d_perp)
-        unique_d_perp = unique_d_perp[np.abs(unique_d_perp) <= width / 2] # Filter out distances beyond glacier width
-        unique_d_perp = np.sort(unique_d_perp)
+        unique_distances_perp = np.unique(distances_perp)
+        unique_distances_perp = unique_distances_perp[np.abs(unique_distances_perp) <= width / 2] # Filter out distances beyond glacier width
+        unique_distances_perp = np.sort(unique_distances_perp)
 
         # Initialize arrays for binned values
         bin_distances = []
         bin_elevations_topo = []
-        bin_elevations_ice = []
+        bin_deviations_ice = []
         bin_widths = []
     
-        for d_p in unique_d_perp:
-
-            at_this_distance = (d_perp == d_p)
-            d_along_bin = d_along[at_this_distance]
+        for dist in unique_distances_perp:
+            at_this_distance = (distances_perp == dist)
+            distance_along_bin = distances_along[at_this_distance]
             topo_bin = topography_elevations[at_this_distance]
-            ice_bin = ice_surface_elevations[at_this_distance]
+            ice_bin = ice_surface_elevations[at_this_distance] - reference_ice_elevation[at_this_distance]
             
             # Inverse-distance weighting based on along-flow distance
             epsilon = 1e-6
-            weights = 1.0 / (np.abs(d_along_bin) + epsilon)
+            weights = 1.0 / (np.abs(distance_along_bin) + epsilon)
             weights /= weights.sum()  # Normalize weights
             
             # Weighted average elevation
@@ -389,14 +457,14 @@ class GlacialErosion(Component):
             avg_ice = np.sum(weights * ice_bin)
             
             # Store bin data
-            bin_distances.append(d_p)
+            bin_distances.append(dist)
             bin_elevations_topo.append(avg_topo)
-            bin_elevations_ice.append(avg_ice)
+            bin_deviations_ice.append(avg_ice)
 
-        # Convert to numpy arrays (sorted from -width/2 to +width/2)
+        # Convert to numpy arrays (in order from -width/2 to +width/2)
         bin_distances = np.array(bin_distances)
         bin_elevations_topo = np.array(bin_elevations_topo)
-        bin_elevations_ice = np.array(bin_elevations_ice)
+        bin_deviations_ice = np.array(bin_deviations_ice)
 
         # Calculate bin widths based on midpoints between unique distances
         if len(bin_distances) > 1:
@@ -415,52 +483,52 @@ class GlacialErosion(Component):
         max_radius = _max_radius(discharge, AB3)
         max_thickness_below = np.maximum(0, max_radius**2 - np.abs(bin_distances)**2)
 
-        thicknesses_above_center = np.clip(
-            (bin_elevations_ice - center_ice_surface) * cos_correction, 0, None
+        bin_ice_thicknesses_above_center = np.clip(
+            bin_deviations_ice * cos_correction, 0, None
         )
-        ice_top_below_center = np.clip(
-            (center_ice_surface - bin_elevations_ice) * cos_correction, 0, max_thickness_below
+        bin_ice_top_below_center = np.clip(
+            - bin_deviations_ice * cos_correction, 0, max_thickness_below
         )
-        ice_bottom_below_center = np.clip(
-            (center_ice_surface - bin_elevations_topo) * cos_correction, 0, max_thickness_below
+        bin_ice_bottom_below_center = np.clip(
+            (center_ice_elevation - bin_elevations_topo) * cos_correction, 0, max_thickness_below
         )
 
         # Where nodes are completely outside the max allowed radius (further horizontally), thicknesses should be set to 0.
         outside_range_bins = np.abs(bin_distances) > max_radius
-        thicknesses_above_center[outside_range_bins] = 0
-        ice_top_below_center[outside_range_bins] = 0
-        ice_bottom_below_center[outside_range_bins] = 0
+        bin_ice_thicknesses_above_center[outside_range_bins] = 0
+        bin_ice_top_below_center[outside_range_bins] = 0
+        bin_ice_bottom_below_center[outside_range_bins] = 0
 
         area_cross_section = np.sum(
-            bin_widths * (ice_bottom_below_center - ice_top_below_center + thicknesses_above_center)
+            bin_widths * (bin_ice_bottom_below_center - bin_ice_top_below_center + bin_ice_thicknesses_above_center)
         )
         
         flow_below_center = np.sum(
             bin_widths * (
-                1/5 * (ice_bottom_below_center**5 - ice_top_below_center**5) +
-                2/3 * bin_distances**2 * (ice_bottom_below_center**3 - ice_top_below_center**3) +
-                bin_distances**4 * (ice_bottom_below_center - ice_top_below_center)
+                1/5 * (bin_ice_bottom_below_center**5 - bin_ice_top_below_center**5) +
+                2/3 * bin_distances**2 * (bin_ice_bottom_below_center**3 - bin_ice_top_below_center**3) +
+                bin_distances**4 * (bin_ice_bottom_below_center - bin_ice_top_below_center)
             )
         )
         #Ice above the center line is assumed to move at the same rate as the surface (without deformation), integrated separately
-        flow_above_center = np.sum(bin_widths * thicknesses_above_center * bin_distances**4)
-        flow = flow_below_center + flow_above_center
+        flow_above_center = np.sum(bin_widths * bin_ice_thicknesses_above_center * bin_distances**4)
+        total_ice_flow = flow_below_center + flow_above_center
 
         if area_cross_section != 0:
-            velocity_0 = (discharge - AB3/4 * flow) / area_cross_section
+            velocity_0 = (discharge - AB3/4 * total_ice_flow) / area_cross_section
             
             # Calculate basal velocities using original node topography (not binned)
             node_ice_bottom = np.clip(
-                (center_ice_surface - topography_elevations) * cos_correction, 
+                (reference_ice_elevation - topography_elevations) * cos_correction, 
                 0, 
-                np.maximum(0, max_radius**2 - np.abs(d_perp)**2)
+                np.maximum(0, max_radius**2 - np.abs(distances_perp)**2)
             )
             
-            basal_velocities = AB3/4 * ((node_ice_bottom**2 + d**2)**2) + velocity_0 #Previously using d_perp, using standard distance smooths results a bit.
-            surface_velocities = AB3/4 * (d**4) + velocity_0
+            basal_velocities = AB3/4 * ((node_ice_bottom**2 + distances**2)**2) + velocity_0 #Previously used distance_perp, but using standard distance lets the influence of a node decay at distance.
+            surface_velocities = AB3/4 * (distances**4) + velocity_0
 
             # Nodes outside glacier width get zero velocity
-            outside_range_nodes = np.abs(d_perp) > max_radius
+            outside_range_nodes = np.abs(distances_perp) > max_radius
             basal_velocities[outside_range_nodes] = 0
             surface_velocities[outside_range_nodes] = 0
 
@@ -468,94 +536,16 @@ class GlacialErosion(Component):
             basal_velocities = np.zeros(len(swath_array))
             surface_velocities = np.zeros(len(swath_array))
         
-        return swath_array, basal_velocities, surface_velocities, max_radius
-
-    def cross_section_integration(self, center_node, constant_ice_level=False):
-        slope = _clamp(self._grid.at_node['ice__slope'][center_node], 0.0001, 1)
-        width = self._grid.at_node['glacier__width'][center_node]
-        discharge = self._grid.at_node['ice__discharge'][center_node]/SECPERYEAR
-        B = -0.5*self._density_ice*self._grav_accel*_sinarctan(slope)
-        AB3 = self._glen_const*B**3
-        cos_correction = _cosarctan(slope)
-
-        swath = self.swaths[center_node]
-        
-        #Calculate distances accross the swath
-        swath_array = np.array(swath)
-        dx = self._grid.node_x[swath_array] - self._grid.node_x[center_node]
-        dy = self._grid.node_y[swath_array] - self._grid.node_y[center_node]
-        distances = np.sqrt(dx**2 + dy**2)
-
-        # Sort swath by distance
-        sort_indices = np.argsort(distances)
-        distances = distances[sort_indices]
-        swath = swath_array[sort_indices]
-
-        #Obtain ice and topography elevations
-        center_ice_surface = self._grid.at_node["ice__elevation"][center_node]
-        topography_elevations = self._grid.at_node["topographic__elevation"][swath]
-        ice_surface_elevations = self._grid.at_node["ice__elevation"][swath]
-
-        if constant_ice_level == True:
-            ice_surface_elevations = np.full_like(ice_surface_elevations, center_ice_surface)
-
-        # Divide the distance between center and rim of glacier (halfwidth) into buckets, by calculating the distance between midpoints between nodes
-        if len(swath) > 1:
-            bucket_widths = np.zeros(len(distances))
-            bucket_widths[0] = distances[1] / 2
-            bucket_widths[1:-1] = (distances[2:] - distances[:-2]) / 2
-            bucket_widths[-1] = (distances[-1] - distances[-2]) / 2 + width / 2 - distances[-1]
-        else:
-            bucket_widths = np.array([width / 2])
-
-        
-        #Where ice extends below the max range, set to the max range
-        max_radius = width/2 #_max_radius(discharge, AB3)
-        max_thickness_below = max_radius**2 - np.square(distances) 
-
-        thicknesses_above_center = np.clip((ice_surface_elevations - center_ice_surface)*cos_correction, a_min=0, a_max=None)
-        ice_top_below_center = np.clip((center_ice_surface - ice_surface_elevations)*cos_correction, a_min=0, a_max=max_thickness_below) 
-        ice_bottom_below_center = np.clip((center_ice_surface - topography_elevations)*cos_correction, a_min=0, a_max=max_thickness_below)
-
-        #Where nodes are completely outside the max allowed radius (further horizontally), thicknesses should be set to 0.
-        outside_range = distances > max_radius
-        thicknesses_above_center[outside_range] = 0
-        ice_top_below_center[outside_range] = 0
-        ice_bottom_below_center[outside_range] = 0
-
-        area_cross_section = np.sum(bucket_widths*(ice_bottom_below_center - ice_top_below_center + thicknesses_above_center))
-        
-        if area_cross_section !=0:
-            #Ice above the center line is assumed to move at the same rate as the surface (without deformation), integrated separately
-            flow_below_center = np.sum(bucket_widths*(
-                1/5 * (ice_bottom_below_center**5 - ice_top_below_center**5) + 
-                2/3 * distances**2 * (ice_bottom_below_center**3 - ice_top_below_center**3) + 
-                distances**4 * (ice_bottom_below_center - ice_top_below_center)
-                ))
-            flow_above_center = np.sum(bucket_widths*thicknesses_above_center*distances**4)
-            flow = flow_below_center + flow_above_center
-
-            velocity_0 = (discharge - AB3/4*flow*2)/(area_cross_section*2)
-            basal_velocities = AB3/4*((ice_bottom_below_center**2 + distances**2)**2) + velocity_0
-            surface_velocities = AB3/4 * (distances**4) + velocity_0
-
-            # Nodes outside glacier width get zero velocity
-            basal_velocities[outside_range] = 0
-            surface_velocities[outside_range] = 0
-
-        else:
-            basal_velocities = np.zeros(len(swath))
-            surface_velocities = np.zeros(len(swath))
-
-        return swath, basal_velocities, surface_velocities
+        return swath_array, basal_velocities, surface_velocities, area_cross_section
 
     def calc_velocities(self):
         sliding_velocities = np.zeros(self._grid.number_of_nodes)
         surface_velocities = np.zeros(self._grid.number_of_nodes)
-        max_radii = np.zeros(self._grid.number_of_nodes)
+        glacier_cross_section = np.zeros(self._grid.number_of_nodes)
+        glacier_center_nodes = np.zeros(self._grid.number_of_nodes)
         
         for swath in self.swaths:
-            sorted_swath, sliding_velocities_swath, surface_velocities_swath, max_radius_swath = self.dir_cross_section_integration(swath[0])
+            sorted_swath, sliding_velocities_swath, surface_velocities_swath, area_cross_section = self.dir_cross_section_integration(swath[0], thickness_agnostic=False)
             sorted_swath = np.array(sorted_swath)
             
             # Convert to annual velocities
@@ -568,16 +558,16 @@ class GlacialErosion(Component):
             # Update both velocities only where basal velocity increases
             sliding_velocities[sorted_swath[nodes_to_update]] = sliding_annual[nodes_to_update]
             surface_velocities[sorted_swath[nodes_to_update]] = surface_annual[nodes_to_update]
-            max_radii[sorted_swath[nodes_to_update]] = max_radius_swath
+            glacier_cross_section[sorted_swath[nodes_to_update]] = area_cross_section
+            glacier_center_nodes[sorted_swath[nodes_to_update]] = swath[0]
         
         _ = self._grid.add_field('ice__sliding_velocity', sliding_velocities, clobber=True)
         _ = self._grid.add_field('ice__surface_velocity', surface_velocities, clobber=True)
         _ = self._grid.add_field('ice__erosion_rate', self._erosion_const * sliding_velocities**self._erosion_exp, clobber=True)
-        _ = self._grid.add_field('ice__max_radius', max_radii, clobber=True)
+        _ = self._grid.add_field('glacier__cross_section', glacier_cross_section, clobber=True)
+        _ = self._grid.add_field('glacier__center_node', glacier_center_nodes, clobber=True)
        
     def run_one_step(self, dt, stabilise_erosion=False):
-        self.calc_swaths(use_flow_network=False, exclude_cardinal_nodes=False)
-        self.calc_ice_thicknesses()
         self.calc_velocities()
 
         erosion_elevation = self._grid.at_node["topographic__elevation"] - self._grid.at_node['ice__erosion_rate']*dt
@@ -588,8 +578,37 @@ class GlacialErosion(Component):
         else:
             self._grid.at_node["topographic__elevation"] = erosion_elevation
 
-    def erode_topography(self, timestep_size=100, num_timesteps=5, flowroute_recalc_interval=None):
-        for t in range(num_timesteps):
-            if flowroute_recalc_interval != None and t % flowroute_recalc_interval == 0:
+    def erode_topography(self, number_of_years=100, max_erosion=2, flowroute_recalc_interval=10):
+        always_recalc_flowroute = False
+        flowroute_recalc_stops = []
+
+        if flowroute_recalc_interval is None:
+            pass
+        elif flowroute_recalc_interval == 0:
+            always_recalc_flowroute = True
+        else:
+            num_stops = int(number_of_years/flowroute_recalc_interval)
+            flowroute_recalc_stops = [i*flowroute_recalc_interval for i in range(1,num_stops)]
+
+        years_elapsed = 0
+
+        while years_elapsed < number_of_years:
+            self.calc_velocities()
+            highest_erosion_rate = np.max(self._grid.at_node['ice__erosion_rate'])
+
+
+            dt = max_erosion/highest_erosion_rate
+
+            if years_elapsed + dt >= number_of_years:
+                dt = number_of_years - years_elapsed
+            elif flowroute_recalc_stops:
+                if years_elapsed + dt >= flowroute_recalc_stops[0]:
+                    dt = flowroute_recalc_stops[0] - years_elapsed
+                    flowroute_recalc_stops.pop(0)
+                    self._determine_flow()
+            elif always_recalc_flowroute is True:
                 self._determine_flow()
-            self.run_one_step(timestep_size)
+            
+            self._grid.at_node["topographic__elevation"] -= self._grid.at_node['ice__erosion_rate']*dt
+            years_elapsed += dt
+            print('dt =', dt, 'years elapsed:', years_elapsed)
