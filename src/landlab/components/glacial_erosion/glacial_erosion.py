@@ -119,18 +119,20 @@ class GlacialErosion(Component):
         self._melt_rate_scaling_factor = melt_rate_scaling_factor
         self._determine_flow()
         
-    def _dist_two_nodes(self, node1, node2):
-        '''Calculate the horizontal euclidian distance between two nodes on the modelgrid.
+    def _delta_two_nodes(self, node1, node2):
+        '''Calculate distances along x,y and elevation between two nodes on the modelgrid.
         node1 : int
             index of the first node
         node2 : int
             index of the second node
         '''
         if node1 == node2:
-            distance = 0
-        else: 
-            distance = ((self._grid.node_x[node1] - self._grid.node_x[node2])**2 + (self._grid.node_y[node1] - self._grid.node_y[node2])**2)**0.5
-        return distance
+            return 0, 0, 0, 0
+        delta_x = self._grid.node_x[node1] - self._grid.node_x[node2]
+        delta_y = self._grid.node_y[node1] - self._grid.node_y[node2]
+        delta_z = self._grid.at_node["topographic__elevation"][node1] - self._grid.at_node["topographic__elevation"][node2]
+        horizontal_distance = (delta_x**2 + delta_y**2)**0.5
+        return horizontal_distance, delta_x, delta_y, delta_z
     
     def _build_donor_dict(self):
         """Build a dictionary mapping each node to its donors."""
@@ -195,7 +197,7 @@ class GlacialErosion(Component):
                 
                 for donor in donors:
                     if donor not in visited:
-                        dist = self._dist_two_nodes(donor, original_node)
+                        dist, distx, disty, distz = self._delta_two_nodes(donor, original_node)
                         if dist < half_width:
                             swath.append(donor)
                             visited.add(donor)
@@ -242,8 +244,8 @@ class GlacialErosion(Component):
 
         _ = self._grid.add_field('glacier__discharge', glacier_discharge, at='node', clobber=True)
 
-        #To do: Remove the temporary surface_water__discharge field to avoid confusion
-        #To do: Run flowrouter again with precipitation of water? 
+        #TODO: Remove the temporary surface_water__discharge field to avoid confusion
+        #TODO: Run flowrouter again with precipitation of water? 
 
         # Calculate glacier width
         glacier_width = self._width_scaling_const*(glacier_discharge*self._grid.dx)**self._width_scaling_exp
@@ -254,7 +256,6 @@ class GlacialErosion(Component):
         self._obtain_largest_donors() #Pre-compute largest donors for every node
         self._calc_flow_directions() #Pre-compute flow directions and slope
         self.calc_swaths()
-        self.calc_ice_thicknesses()
     
     def calc_swaths(self, use_flow_network=False, exclude_cardinal_nodes=False):
         self.swaths = []
@@ -280,6 +281,36 @@ class GlacialErosion(Component):
                 swaths_number_of_nodes[node] = max(len(swath), swaths_number_of_nodes[node])
 
         _ = self._grid.add_field('glacier__swath_number_of_nodes', swaths_number_of_nodes, clobber=True)
+    
+    def _follow_downstream(self, starting_node, receiver_array, max_distance):
+        '''
+        Follows nodes downstream until the max_distance is reached. Can be used to follow upstream if instead a largest donor array is used as input.
+
+        starting_node : int 
+            Node ID of the starting node
+        receiver_array : numpy array
+            array indicating the receiver (or largest donor) node of every node's dicharge
+        max_distance : float
+            Maximum radius to follow nodes to.
+        '''
+        current_node = starting_node
+        
+        while True:
+            next_node = receiver_array[current_node]
+
+            if next_node == current_node:  # No more receivers/donors
+                break
+            
+            distance, _, _, _ = self._delta_two_nodes(starting_node, next_node)
+            
+            if distance > max_distance:  # Outside range
+                break
+            
+            current_node = next_node
+
+        final_node = current_node
+
+        return final_node
 
     def _calc_flow_directions(self):
         """Calculate 2D flow direction components and slopes for all nodes.
@@ -291,62 +322,21 @@ class GlacialErosion(Component):
         flow_x_normalized = np.zeros(num_nodes)
         flow_y_normalized = np.zeros(num_nodes)
         slope = np.zeros(num_nodes)
-        elevations = self._grid.at_node["topographic__elevation"]
         receivers = self._grid.at_node["flow__receiver_node"]
+        donors = self._largest_donor
         
         for center_node in range(num_nodes):
             width = self._grid.at_node['glacier__width'][center_node]
             
-            # Find upstream edge: follow largest donors until outside swath width
-            upstream_node = center_node
-            max_distance = width / 2
+            upstream_node = self._follow_downstream(center_node, donors, width/2)
+            downstream_node = self._follow_downstream(center_node, receivers, width/2)
+            horizontal_distance, delta_x, delta_y, delta_z = self._delta_two_nodes(downstream_node, upstream_node)
             
-            while True:
-                largest_donor = self._largest_donor[upstream_node]
-                
-                if largest_donor == upstream_node:  # No more donors
-                    break
-                
-                dist = self._dist_two_nodes(center_node, largest_donor)
-                
-                if dist > max_distance:  # Outside swath
-                    break
-                
-                upstream_node = largest_donor
-            
-            # Find downstream edge: follow receivers until outside swath width
-            downstream_node = center_node
-            
-            while True:
-                receiver = receivers[downstream_node]
-                
-                if receiver == downstream_node:  # No more receivers
-                    break
-                
-                dist = self._dist_two_nodes(center_node, receiver)
-                
-                if dist > max_distance:  # Outside swath
-                    break
-                
-                downstream_node = receiver
-            
-            # Calculate flow vectors (downstream - upstream)
-            flow_x = self._grid.node_x[downstream_node] - self._grid.node_x[upstream_node]
-            flow_y = self._grid.node_y[downstream_node] - self._grid.node_y[upstream_node]
-            
-            # Calculate elevation change
-            delta_z = elevations[downstream_node] - elevations[upstream_node]
-            
-            # Calculate horizontal distance
-            delta_d = np.sqrt(flow_x**2 + flow_y**2)
-            
-            # Normalize and calculate slope
-            if delta_d > 0:
-                flow_x_normalized[center_node] = flow_x / delta_d
-                flow_y_normalized[center_node] = flow_y / delta_d
-                slope[center_node] = abs(delta_z / delta_d)
+            if horizontal_distance != 0:
+                flow_x_normalized[center_node] = delta_x / horizontal_distance
+                flow_y_normalized[center_node] = delta_y / horizontal_distance
+                slope[center_node] = delta_z / horizontal_distance
             else:
-                # If upstream and downstream are the same node, use zero values
                 flow_x_normalized[center_node] = 0.0
                 flow_y_normalized[center_node] = 0.0
                 slope[center_node] = 0.0
@@ -386,7 +376,6 @@ class GlacialErosion(Component):
         _ = self._grid.add_field('ice__elevation', ice_elevation, clobber=True)
         _ = self._grid.add_field('ice__thickness', ice_elevation - topography, clobber=True)
 
-
     def dir_cross_section_integration(self, center_node, thickness_agnostic=False):
         width = self._grid.at_node['glacier__width'][center_node]
         discharge = self._grid.at_node['glacier__discharge'][center_node]/SECPERYEAR
@@ -401,7 +390,7 @@ class GlacialErosion(Component):
         if flow_x == 0 and flow_y ==0: #No flow, therefore no velocities.
             return swath, np.zeros(len(swath)), np.zeros(len(swath)), 0
         
-        B = -0.5*self._density_ice*self._grav_accel*_sinarctan(slope)
+        B = 0.5*self._density_ice*self._grav_accel*_sinarctan(slope)
         AB3 = self._glen_const*B**3
         cos_correction = _cosarctan(slope)
 
@@ -593,6 +582,7 @@ class GlacialErosion(Component):
         years_elapsed = 0
 
         while years_elapsed < number_of_years:
+            self.calc_ice_thicknesses()
             self.calc_velocities()
             highest_erosion_rate = np.max(self._grid.at_node['ice__erosion_rate'])
 
