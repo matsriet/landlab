@@ -48,11 +48,11 @@ class GlacialErosion(Component):
         melt_rate_scaling_factor=1,
         width_scaling_exp=0.3,
         width_scaling_const=1,
-        thickness_to_width_ratio=0.25,
+        thickness_to_width_ratio_guess=0.25,
         density_ice=920,
         grav_accel = 9.8,
         glen_exp = 3, #Not used at the moment, hardcoded, equations need updating.
-        sliding_const = 3.27,
+        sliding_const = 10**(-19),
         erosion_exp = 2,
         erosion_const = 2.5*10**(-6),
         glen_const = 24*10**(-25),
@@ -78,7 +78,7 @@ class GlacialErosion(Component):
             Discharge to glacier width power law exponent. Defaults to 0.3 (Hergarten, 2021).
         width_scaling_const: 
             Discharge to glacier width power law proportionality constant (units vary depending on the value of width_scaling_exp).
-        thickness_to_width_ratio:
+        thickness_to_width_ratio_guess:
             Assumed thickness to width ratio for the glacier [-]. Should be <0.5 to prevent gaps in the glaciers. Defaults to 0.25 (Liebl et al 2023).
         density_ice : float
             Denisty of ice [kg/m^3]. Defaults to 920 kg/m^3.
@@ -87,7 +87,7 @@ class GlacialErosion(Component):
         glen_exp : float
             Glen-Nye flow law exponent. Defaults to 3.
         sliding_const : float
-            Sliding velocity proportionality constant [m^-1 yr^-1]. Defaults to 3.27 m/yr (Tomkin, 2003).
+            Sliding velocity proportionality constant [m^2 s^-1 Pa^-3]. Defaults to 10**(-19) (Prasicek et al., 2020).
         erosion_exp : float
             Basal velocity to erosion rate power law exponent. Defaults to 2.
         erosion_const : float
@@ -108,7 +108,7 @@ class GlacialErosion(Component):
 
         self._width_scaling_exp = width_scaling_exp
         self._width_scaling_const = width_scaling_const
-        self._thickness_to_width_ratio = thickness_to_width_ratio
+        self._thickness_to_width_ratio_guess = thickness_to_width_ratio_guess
         self._density_ice = density_ice
         self._grav_accel = grav_accel
         self._glen_exp = glen_exp
@@ -625,7 +625,8 @@ class GlacialErosion(Component):
 
         normalized_crosssectional_area = self._calculate_lookup_overlap(bin_distances_normalized, bin_widths_normalized, ice_thicknesses_normalized)
         crosssectional_area = normalized_crosssectional_area * largest_distance * center_thickness
-        sliding_velocity = self._sliding_const/SECPERYEAR * center_thickness ** (self._glen_exp - 1) * abs(slope)**self._glen_exp
+        fs = (self._density_ice*self._grav_accel)**self._glen_exp * self._sliding_const
+        sliding_velocity = fs * center_thickness ** (self._glen_exp - 1) * abs(slope)**self._glen_exp
         
         k = self._density_ice * self._grav_accel * corrected_thickness * _sinarctan(abs(slope))
         velocity_profile = corrected_thickness * self._glen_const * k**self._glen_exp * nondimensional_velocity_profile
@@ -644,7 +645,7 @@ class GlacialErosion(Component):
         slope = self._grid.at_node['glacier__slope'][center_node]
 
         #Initialize values
-        center_thickness = width*self._thickness_to_width_ratio
+        center_thickness = width*self._thickness_to_width_ratio_guess
         thickness_min = 0
         discharge_min = 0
         thickness_max = np.inf
@@ -662,7 +663,7 @@ class GlacialErosion(Component):
             predicted_discharge, velocity_profile, largest_distance, sliding_velocity = self._discharge_from_thickness(center_thickness, bin_distances, bin_widths, bin_elevations_topo, slope)
 
             #print(f"Center thickness: {center_thickness}, Predicted discharge: {predicted_discharge}")
-
+            
             if predicted_discharge < target_discharge:
                 thickness_min = center_thickness
                 discharge_min = predicted_discharge
@@ -672,6 +673,8 @@ class GlacialErosion(Component):
 
             if np.isinf(thickness_max):
                 center_thickness *= 2
+            elif thickness_min == 0:
+                center_thickness /= 2
             else:
                 center_thickness = (thickness_min*(discharge_max - target_discharge) - thickness_max*(discharge_min - target_discharge)) / (discharge_max - discharge_min)
 
@@ -730,6 +733,9 @@ class GlacialErosion(Component):
         #_ = self._grid.add_field('glacier__width', np.zeros(self._grid.number_of_nodes), clobber=True) # rename
 
         for center_node in range(self._grid.number_of_nodes):
+            if self._grid.at_node['glacier__discharge'][center_node] <= 0:
+                continue  # Skip nodes with no discharge, as they will have no ice
+
             # Calculate swath characteristics
             swath_distances, swath_distances_along, swath_distances_perp, swath_relative_elevations = self._swath_characteristics(center_node)
 
