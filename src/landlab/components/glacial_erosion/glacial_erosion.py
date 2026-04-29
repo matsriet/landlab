@@ -263,6 +263,7 @@ class GlacialErosion(Component):
         self._obtain_largest_donors() #Pre-compute largest donors for every node
         self._calc_flow_directions() #Pre-compute flow directions and slope
         self._calc_swaths()
+        self._upstream_node_order = self._grid.at_node['flow__upstream_node_order'].copy()
     
     def _initialize_lookup_table(self):
         """Obtain a lookup table for nondimensional velocities based on the distance from the center line and the ice thickness, precalculated using Nye's numerical procedure.
@@ -604,7 +605,7 @@ class GlacialErosion(Component):
         corrected_thickness = center_thickness * _cosarctan(slope)
         
         if center_thickness <= 0:
-            return 0, self._lookup_velocity(1)*0, 0
+            return 0, self._lookup_velocity(1)*0, 0, 0
 
         # Deformation velocity
         # Calculate ice thicknesses for each bin
@@ -612,6 +613,8 @@ class GlacialErosion(Component):
 
         # Find largest distance with non-zero ice thickness
         nonzero_thickness = np.where(ice_thicknesses > 0)
+        if nonzero_thickness[0].size == 0:
+            return 0, self._lookup_velocity(1)*0, 0, 0
         largest_distance = bin_distances[nonzero_thickness].max() + bin_widths[nonzero_thickness][bin_distances[nonzero_thickness].argmax()]/2
 
         # Determine the W parameter (halfwidth to thickness ratio) and lookup velocity profile
@@ -622,7 +625,11 @@ class GlacialErosion(Component):
         bin_distances_normalized = bin_distances / largest_distance
         bin_widths_normalized = bin_widths / largest_distance
         ice_thicknesses_normalized = ice_thicknesses / center_thickness
-
+        
+        if not np.isfinite(center_thickness) or center_thickness > 1e6:
+            print(f"center_thickness={center_thickness}, slope={slope}")
+            input("Press Enter to continue...")
+            
         normalized_crosssectional_area = self._calculate_lookup_overlap(bin_distances_normalized, bin_widths_normalized, ice_thicknesses_normalized)
         crosssectional_area = normalized_crosssectional_area * largest_distance * center_thickness
         fs = (self._density_ice*self._grav_accel)**self._glen_exp * self._sliding_const
@@ -638,14 +645,17 @@ class GlacialErosion(Component):
 
         return discharge_sum, velocity_profile, largest_distance, sliding_velocity
 
-    def _discharge_iteration(self, center_node, bin_distances, bin_widths, bin_elevations_topo):
+    def _discharge_iteration(self, center_node, bin_distances, bin_widths, bin_elevations_topo, initial_thickness_guess=None):
         '''Find thickness and velocity profile using regula falsi. This is done by iteratively adjusting the center thickness and calculating the resulting discharge until it matches the target discharge within a certain tolerance.'''
         target_discharge = self._grid.at_node['glacier__discharge'][center_node]/SECPERYEAR
         width = self._grid.at_node['glacier__width'][center_node]
         slope = self._grid.at_node['glacier__slope'][center_node]
 
         #Initialize values
-        center_thickness = width*self._thickness_to_width_ratio_guess
+        if initial_thickness_guess is not None:
+            center_thickness = initial_thickness_guess
+        else:
+            center_thickness = width*self._thickness_to_width_ratio_guess
         thickness_min = 0
         discharge_min = 0
         thickness_max = np.inf
@@ -657,13 +667,24 @@ class GlacialErosion(Component):
         if target_discharge == 0:
             return 0, 0, velocity_profile, 0, sliding_velocity
         
-        #print(f"Starting discharge iteration for node {center_node} with target discharge {target_discharge} m^3/s and initial thickness guess {center_thickness} m")
+        # Iteration tracking for debugging
+        debug_mode = False
+        MAX_NORMAL_ITERS = 10
+        iteration = 0
+        thickness_history = []
+        discharge_history = []
+        verbose_mode = False
 
         while abs((predicted_discharge - target_discharge)/target_discharge) > 1e-2:
+            converged_thickness = center_thickness
             predicted_discharge, velocity_profile, largest_distance, sliding_velocity = self._discharge_from_thickness(center_thickness, bin_distances, bin_widths, bin_elevations_topo, slope)
 
-            #print(f"Center thickness: {center_thickness}, Predicted discharge: {predicted_discharge}")
-            
+            if verbose_mode:
+                print(f"  iter {iteration}: thickness={converged_thickness:.8f}, discharge={predicted_discharge:.8f}")
+            else:
+                thickness_history.append(converged_thickness)
+                discharge_history.append(predicted_discharge)
+
             if predicted_discharge < target_discharge:
                 thickness_min = center_thickness
                 discharge_min = predicted_discharge
@@ -671,17 +692,39 @@ class GlacialErosion(Component):
                 thickness_max = center_thickness
                 discharge_max = predicted_discharge
 
+            prev_thickness = center_thickness
+
+            if iteration > MAX_NORMAL_ITERS and thickness_max - thickness_min < 1e-2:
+                #Prevent infinite loop if thickness converges but discharge does not (due to numerical issues in the lookup table extrapolation). 
+                #In that case, we take the converged thickness as the best estimate and move on, even if the discharge is not within the target tolerance.
+                if verbose_mode:
+                    print(f"Thickness converged, without discharge convergence after {iteration} iterations: thickness={center_thickness:.8f}, discharge={predicted_discharge:.8f} (target={target_discharge:.8f})")
+                break
+
+            #Regula falsi doesn't work if the lower bound is zero or the upper bound is infinite, so we use simple steps until we have a valid range, then switch to regula falsi.
             if np.isinf(thickness_max):
-                center_thickness *= 2
+                center_thickness *= 1.5
             elif thickness_min == 0:
-                center_thickness /= 2
+                center_thickness /= 1.5
             else:
                 center_thickness = (thickness_min*(discharge_max - target_discharge) - thickness_max*(discharge_min - target_discharge)) / (discharge_max - discharge_min)
 
-        #print(f"Converged on thickness {center_thickness} with discharge {predicted_discharge} (target was {target_discharge}, with an average velocity of: {np.mean(velocity_profile)})")
-        #input("Press Enter to continue...")
+            if center_thickness == prev_thickness:
+                print(f"Thickness stuck at {center_thickness:.8f} on iter {iteration} (node {center_node}, target={target_discharge:.8f} m^3/s, predicted={predicted_discharge:.8f})")
+                #input("Press Enter to continue...")
 
-        return center_thickness, largest_distance, velocity_profile, predicted_discharge, sliding_velocity
+            iteration += 1
+            if not verbose_mode and iteration >= MAX_NORMAL_ITERS and debug_mode:
+                verbose_mode = True
+                print(f"Discharge iteration for node {center_node} taking long (target={target_discharge:.8f} m^3/s).")
+                print(f"Thickness history so far:  {[f'{t:.8f}' for t in thickness_history]}")
+                print(f"Discharge history so far:  {[f'{d:.8f}' for d in discharge_history]}")
+
+        if verbose_mode:
+            print(f"Converged after {iteration} iterations: thickness={converged_thickness:.8f}, discharge={predicted_discharge:.8f} (target={target_discharge:.8f})")
+            #input("Press Enter to continue...")
+
+        return converged_thickness, largest_distance, velocity_profile, predicted_discharge, sliding_velocity
     
     def _ice_in_swath(self, center_thickness, largest_distance, velocity_profile, sliding_velocity, swath_distances, swath_distances_along, swath_relative_elevations):
         # Calculate ice thicknesses using center thickness.
@@ -732,18 +775,27 @@ class GlacialErosion(Component):
         _ = self._grid.add_field('glacier__center_node', np.zeros(self._grid.number_of_nodes), clobber=True)
         #_ = self._grid.add_field('glacier__width', np.zeros(self._grid.number_of_nodes), clobber=True) # rename
 
-        for center_node in range(self._grid.number_of_nodes):
-            if self._grid.at_node['glacier__discharge'][center_node] <= 0:
-                continue  # Skip nodes with no discharge, as they will have no ice
+        # Initialize thickness guesses for this timestep using the default ratio
+        glacier_width = self._grid.at_node['glacier__width']
+        thickness_guess = glacier_width * self._thickness_to_width_ratio_guess
+
+        for center_node in reversed(self._upstream_node_order):
+            if self._grid.at_node['glacier__discharge'][center_node] <= 0 or self._grid.at_node['glacier__slope'][center_node] >= -0.001:
+                continue  # Skip nodes with no discharge or very low slope (or uphill), as they will have little to no ice flow and therefore won't contribute to erosion. This also prevents numerical issues in the discharge iteration for these nodes.
 
             # Calculate swath characteristics
             swath_distances, swath_distances_along, swath_distances_perp, swath_relative_elevations = self._swath_characteristics(center_node)
 
             # Bin the swath to get cross-sectional topography
             bin_distances, bin_widths, bin_elevations_topo = self._bin_cross_section(center_node, swath_distances_along, swath_distances_perp, swath_relative_elevations)
-            
+
             # Use the binned cross section to iteratively solve for the center ice thickness that matches the target discharge, and obtain the velocity profile across the swath.
-            center_thickness, largest_distance, velocity_profile, predicted_discharge, sliding_velocity = self._discharge_iteration(center_node, bin_distances, bin_widths, bin_elevations_topo)
+            center_thickness, largest_distance, velocity_profile, predicted_discharge, sliding_velocity = self._discharge_iteration(center_node, bin_distances, bin_widths, bin_elevations_topo, initial_thickness_guess=thickness_guess[center_node])
+
+            # Pass converged thickness as initial guess to the receiver node
+            receiver = self._grid.at_node['flow__receiver_node'][center_node]
+            if receiver != center_node:
+                thickness_guess[receiver] = center_thickness
 
             # Calculate ice thicknesses and velocities across the swath
             ice_thicknesses, swath_basal_velocities, swath_surface_velocities = self._ice_in_swath(center_thickness, largest_distance, velocity_profile, sliding_velocity, swath_distances, swath_distances_along, swath_relative_elevations)
