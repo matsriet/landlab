@@ -297,18 +297,20 @@ class GlacialErosion(Component):
         return normalized_surface_area
     
     # --- Flow routing and swath calculation ---
-    def _delta_two_nodes(self, node1, node2):
+    def _delta_two_nodes(self, node1, node2, elevation_field="topographic__elevation"):
         '''Calculate distances along x,y and elevation between two nodes on the modelgrid.
         node1 : int
             index of the first node
         node2 : int
             index of the second node
+        elevation_field : str
+            grid field name to use for elevation (default: "topographic__elevation")
         '''
         if node1 == node2:
             return 0, 0, 0, 0
         delta_x = self._grid.node_x[node1] - self._grid.node_x[node2]
         delta_y = self._grid.node_y[node1] - self._grid.node_y[node2]
-        delta_z = self._grid.at_node["topographic__elevation"][node1] - self._grid.at_node["topographic__elevation"][node2]
+        delta_z = self._grid.at_node[elevation_field][node1] - self._grid.at_node[elevation_field][node2]
         horizontal_distance = (delta_x**2 + delta_y**2)**0.5
         return horizontal_distance, delta_x, delta_y, delta_z
 
@@ -386,10 +388,14 @@ class GlacialErosion(Component):
 
         _ = self._grid.add_field('glacier__swath_number_of_nodes', swaths_number_of_nodes, clobber=True)
 
-    def _calc_flow_directions(self):
+    def _calc_flow_directions(self, elevation_field="topographic__elevation"):
         """Calculate 2D flow direction components and slopes for all nodes.
         Computed from the distances between upstream and downstream edge nodes of the swath.
         Stores results as grid fields.
+
+        elevation_field : str
+            Grid field to use for slope calculation (default: "topographic__elevation").
+            Pass "ice__elevation" to compute ice surface slope instead.
         """
         # Initialize arrays
         num_nodes = self._grid.number_of_nodes
@@ -398,14 +404,14 @@ class GlacialErosion(Component):
         slope = np.zeros(num_nodes)
         receivers = self._grid.at_node["flow__receiver_node"]
         donors = self._largest_donor
-        
+
         for center_node in range(num_nodes):
             width = self._grid.at_node['glacier__width'][center_node]
-            
+
             upstream_node = self._follow_downstream(center_node, donors, width/2)
             downstream_node = self._follow_downstream(center_node, receivers, width/2)
-            horizontal_distance, delta_x, delta_y, delta_z = self._delta_two_nodes(downstream_node, upstream_node)
-            
+            horizontal_distance, delta_x, delta_y, delta_z = self._delta_two_nodes(downstream_node, upstream_node, elevation_field=elevation_field)
+
             if horizontal_distance != 0:
                 flow_x_normalized[center_node] = delta_x / horizontal_distance
                 flow_y_normalized[center_node] = delta_y / horizontal_distance
@@ -414,13 +420,13 @@ class GlacialErosion(Component):
                 flow_x_normalized[center_node] = 0.0
                 flow_y_normalized[center_node] = 0.0
                 slope[center_node] = 0.0
-        
+
         # Store as grid fields
         self._grid.add_field('glacier__flow_direction_x', flow_x_normalized, clobber=True)
         self._grid.add_field('glacier__flow_direction_y', flow_y_normalized, clobber=True)
         self._grid.add_field('glacier__slope', slope, clobber=True)
 
-    def determine_flow(self):
+    def determine_flow(self, use_ice_elevation=True):
         if self._equilibrium_line_altitude == None or self._full_ice_altitude == None:
             # All precipitation is converted to ice
             self._precipitation_rate_ice = self._precipitation_rate
@@ -464,7 +470,10 @@ class GlacialErosion(Component):
 
         self._build_donor_dict()  # Pre-compute donor relationships
         self._obtain_largest_donors() #Pre-compute largest donors for every node
-        self._calc_flow_directions() #Pre-compute flow directions and slope
+        elevation_field = "topographic__elevation"
+        if use_ice_elevation and 'ice__elevation' in self._grid.at_node:
+            elevation_field = 'ice__elevation'
+        self._calc_flow_directions(elevation_field=elevation_field) #Pre-compute flow directions and slope
         self._calc_swaths()
         self._upstream_node_order = self._grid.at_node['flow__upstream_node_order'].copy()
     
