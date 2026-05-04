@@ -162,61 +162,6 @@ class GlacialErosion(Component):
                 self._largest_donor[node] = max(donors, key=lambda d: discharge[d])
             # else: stays as -1 (no donor)
 
-    def _cardinal_flowline(self, node):
-        '''Find the cardinal flow line for the node (series of largest donors leading to the node)
-        '''
-        original_node = node
-        cardinal_flowline = [original_node]
-        max_distance = 0.5 * self._grid.at_node['glacier__width'][original_node]
-        
-        while True:
-            largest_donor = self._largest_donor[node]
-            
-            if largest_donor == node:  # No donors
-                break
-            
-            cardinal_flowline.append(largest_donor)
-            node = largest_donor
-            
-            if self._dist_two_nodes(original_node, node) > max_distance:
-                break
-        
-        return cardinal_flowline
-    
-    def _donors_in_swath(self, node, original_node, width_swath, use_flow_network=True, excluded_nodes=None):
-        """Finds the donors of a node and the donors of those donors. 
-        Stops at a donor that is in the excluded nodes list or is outside the glacier width.
-        Uses BFS with a deque."""
-        
-        if excluded_nodes is None:
-            excluded_nodes = []
-
-        if use_flow_network == True:
-            swath = []
-            visited = set(excluded_nodes)  # Track visited nodes to avoid duplicates or nodes in the excluded list
-            queue = deque([node])  # Use deque for O(1) popleft
-
-            half_width = width_swath / 2
-            
-            while queue:
-                current = queue.popleft()
-                donors = self._donor_dict[current]
-                
-                for donor in donors:
-                    if donor not in visited:
-                        dist, distx, disty, distz = self._delta_two_nodes(donor, original_node)
-                        if dist < half_width:
-                            swath.append(donor)
-                            visited.add(donor)
-                            queue.append(donor)  # Continue searching from this donor
-        else:
-            dx = self._grid.node_x - self._grid.node_x[node]
-            dy = self._grid.node_y - self._grid.node_y[node]
-            distances = np.sqrt(dx**2 + dy**2)
-            swath = np.where((distances > 0) & (distances < width_swath/2))[0].tolist()
-        
-        return swath
-    
     def _determine_flow(self):
         if self._equilibrium_line_altitude == None or self._full_ice_altitude == None:
             # All precipitation is converted to ice
@@ -439,20 +384,18 @@ class GlacialErosion(Component):
         
         return normalized_surface_area
     
-    def _calc_swaths(self, use_flow_network=False, exclude_cardinal_nodes=False):
+    def _calc_swaths(self):
         self.swaths = []
         swaths_number_of_nodes = np.zeros(self._grid.number_of_nodes)
 
         for center_node in range(self._grid.number_of_nodes):
             if self._grid.at_node['glacier__width'][center_node]/2 > self._grid.dx:
-
-                if exclude_cardinal_nodes == True:
-                    excluded_nodes = self._cardinal_flowline(center_node)
-                else:
-                    excluded_nodes = []
-
-                donor_indices = self._donors_in_swath(center_node, center_node, self._grid.at_node['glacier__width'][center_node], use_flow_network=use_flow_network, excluded_nodes=excluded_nodes)
-                swath = [center_node] + donor_indices
+                width_swath = self._grid.at_node['glacier__width'][center_node]
+                dx = self._grid.node_x - self._grid.node_x[center_node]
+                dy = self._grid.node_y - self._grid.node_y[center_node]
+                distances = np.sqrt(dx**2 + dy**2)
+                swath = np.where((distances > 0) & (distances < width_swath/2))[0].tolist()
+                swath = [center_node] + swath
 
             else:
                 swath = [center_node]
@@ -625,11 +568,7 @@ class GlacialErosion(Component):
         bin_distances_normalized = bin_distances / largest_distance
         bin_widths_normalized = bin_widths / largest_distance
         ice_thicknesses_normalized = ice_thicknesses / center_thickness
-        
-        if not np.isfinite(center_thickness) or center_thickness > 1e6:
-            print(f"center_thickness={center_thickness}, slope={slope}")
-            input("Press Enter to continue...")
-            
+
         normalized_crosssectional_area = self._calculate_lookup_overlap(bin_distances_normalized, bin_widths_normalized, ice_thicknesses_normalized)
         crosssectional_area = normalized_crosssectional_area * largest_distance * center_thickness
         fs = (self._density_ice*self._grav_accel)**self._glen_exp * self._sliding_const
