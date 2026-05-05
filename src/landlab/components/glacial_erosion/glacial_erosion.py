@@ -551,11 +551,50 @@ class GlacialErosion(Component):
         
         return bin_distances, bin_widths, bin_elevations_topo
     
+    def _calculate_wetted_perimeter(self, center_thickness, bin_distances, bin_elevations_topo):
+        '''Calculate the wetted perimeter of the glacier cross-section using diagonal arc lengths
+        between bin midpoints, assuming a piecewise linear bed profile.'''
+        ice_thicknesses = np.maximum(0, center_thickness - bin_elevations_topo)
+        ice_indices = np.where(ice_thicknesses > 0)[0]
+
+        if len(ice_indices) == 0:
+            return 0.0
+
+        # Arc lengths between consecutive ice-covered bin midpoints
+        consec = np.where(np.diff(ice_indices) == 1)[0]
+        i_bins = ice_indices[consec]
+        j_bins = ice_indices[consec + 1]
+        dx = bin_distances[j_bins] - bin_distances[i_bins]
+        dz = bin_elevations_topo[j_bins] - bin_elevations_topo[i_bins]
+        perimeter = np.sqrt(dx**2 + dz**2).sum()
+
+        # Partial segment to interpolated ice margin on the right side
+        i_last = ice_indices[-1]
+        if i_last + 1 < len(bin_distances):
+            dz_total = bin_elevations_topo[i_last + 1] - bin_elevations_topo[i_last]
+            if dz_total > 0:
+                t = (center_thickness - bin_elevations_topo[i_last]) / dz_total
+                dx_margin = t * (bin_distances[i_last + 1] - bin_distances[i_last])
+                dz_margin = center_thickness - bin_elevations_topo[i_last]
+                perimeter += np.sqrt(dx_margin**2 + dz_margin**2)
+
+        # Partial segment to interpolated ice margin on the left side
+        i_first = ice_indices[0]
+        if i_first - 1 >= 0:
+            dz_total = bin_elevations_topo[i_first - 1] - bin_elevations_topo[i_first]
+            if dz_total > 0:
+                t = (center_thickness - bin_elevations_topo[i_first]) / dz_total
+                dx_margin = t * (bin_distances[i_first] - bin_distances[i_first - 1])
+                dz_margin = center_thickness - bin_elevations_topo[i_first]
+                perimeter += np.sqrt(dx_margin**2 + dz_margin**2)
+
+        return perimeter
+
     def _discharge_from_thickness(self, center_thickness, bin_distances, bin_widths, bin_elevations_topo, slope):
         corrected_thickness = center_thickness * _cosarctan(slope)
         
         if center_thickness <= 0:
-            return 0, self._lookup_velocity(1)*0, 0, 0
+            return 0, self._lookup_velocity(1)*0, 0, 0, 0
 
         # Deformation velocity
         # Calculate ice thicknesses for each bin
@@ -564,7 +603,7 @@ class GlacialErosion(Component):
         # Find largest distance with non-zero ice thickness
         nonzero_thickness = np.where(ice_thicknesses > 0)
         if nonzero_thickness[0].size == 0:
-            return 0, self._lookup_velocity(1)*0, 0, 0
+            return 0, self._lookup_velocity(1)*0, 0, 0, 0
         largest_distance = bin_distances[nonzero_thickness].max() + bin_widths[nonzero_thickness][bin_distances[nonzero_thickness].argmax()]/2
 
         # Determine the W parameter (halfwidth to thickness ratio) and lookup velocity profile
@@ -578,6 +617,7 @@ class GlacialErosion(Component):
 
         normalized_crosssectional_area = self._calculate_lookup_overlap(bin_distances_normalized, bin_widths_normalized, ice_thicknesses_normalized)
         crosssectional_area = normalized_crosssectional_area * largest_distance * center_thickness
+        wetted_perimeter = self._calculate_wetted_perimeter(center_thickness, bin_distances, bin_elevations_topo)
         fs = (self._density_ice*self._grav_accel)**self._glen_exp * self._sliding_const
         sliding_velocity = fs * center_thickness ** (self._glen_exp - 1) * abs(slope)**self._glen_exp
         
@@ -589,7 +629,7 @@ class GlacialErosion(Component):
         discharge = sliding_discharge + deformation_discharge
         discharge_sum = discharge.sum()
 
-        return discharge_sum, velocity_profile, largest_distance, sliding_velocity
+        return discharge_sum, velocity_profile, largest_distance, sliding_velocity, wetted_perimeter
 
     def _discharge_iteration(self, center_node, bin_distances, bin_widths, bin_elevations_topo, initial_thickness_guess=None):
         '''Find thickness and velocity profile using regula falsi. This is done by iteratively adjusting the center thickness and calculating the resulting discharge until it matches the target discharge within a certain tolerance.'''
@@ -623,7 +663,7 @@ class GlacialErosion(Component):
 
         while abs((predicted_discharge - target_discharge)/target_discharge) > 1e-2:
             converged_thickness = center_thickness
-            predicted_discharge, velocity_profile, largest_distance, sliding_velocity = self._discharge_from_thickness(center_thickness, bin_distances, bin_widths, bin_elevations_topo, slope)
+            predicted_discharge, velocity_profile, largest_distance, sliding_velocity, wetted_perimeter = self._discharge_from_thickness(center_thickness, bin_distances, bin_widths, bin_elevations_topo, slope)
 
             if verbose_mode:
                 print(f"  iter {iteration}: thickness={converged_thickness:.8f}, discharge={predicted_discharge:.8f}")
@@ -670,7 +710,7 @@ class GlacialErosion(Component):
             print(f"Converged after {iteration} iterations: thickness={converged_thickness:.8f}, discharge={predicted_discharge:.8f} (target={target_discharge:.8f})")
             #input("Press Enter to continue...")
 
-        return converged_thickness, largest_distance, velocity_profile, predicted_discharge, sliding_velocity
+        return converged_thickness, largest_distance, velocity_profile, predicted_discharge, sliding_velocity, wetted_perimeter
     
     def _ice_in_swath(self, center_thickness, largest_distance, velocity_profile, sliding_velocity, swath_distances, swath_distances_along, swath_relative_elevations):
         # Calculate ice thicknesses using center thickness.
@@ -719,6 +759,7 @@ class GlacialErosion(Component):
         _ = self._grid.add_field('ice__surface_velocity', np.zeros(self._grid.number_of_nodes), clobber=True)
         _ = self._grid.add_field('glacier__cross_section', np.zeros(self._grid.number_of_nodes), clobber=True)
         _ = self._grid.add_field('glacier__center_node', np.zeros(self._grid.number_of_nodes), clobber=True)
+        _ = self._grid.add_field('glacier__wetted_perimeter', np.zeros(self._grid.number_of_nodes), clobber=True)
         #_ = self._grid.add_field('glacier__width', np.zeros(self._grid.number_of_nodes), clobber=True) # rename
 
         # Initialize thickness guesses for this timestep using the default ratio
@@ -736,7 +777,7 @@ class GlacialErosion(Component):
             bin_distances, bin_widths, bin_elevations_topo = self._bin_cross_section(center_node, swath_distances_along, swath_distances_perp, swath_relative_elevations)
 
             # Use the binned cross section to iteratively solve for the center ice thickness that matches the target discharge, and obtain the velocity profile across the swath.
-            center_thickness, largest_distance, velocity_profile, predicted_discharge, sliding_velocity = self._discharge_iteration(center_node, bin_distances, bin_widths, bin_elevations_topo, initial_thickness_guess=thickness_guess[center_node])
+            center_thickness, largest_distance, velocity_profile, predicted_discharge, sliding_velocity, wetted_perimeter = self._discharge_iteration(center_node, bin_distances, bin_widths, bin_elevations_topo, initial_thickness_guess=thickness_guess[center_node])
 
             # Pass converged thickness as initial guess to the receiver node
             receiver = self._grid.at_node['flow__receiver_node'][center_node]
@@ -752,6 +793,7 @@ class GlacialErosion(Component):
             self._grid.at_node['ice__thickness'][swath_nodes[update_mask]] = ice_thicknesses[update_mask]
             self._grid.at_node['ice__basal_velocity'][swath_nodes[update_mask]] = swath_basal_velocities[update_mask]
             self._grid.at_node['ice__surface_velocity'][swath_nodes[update_mask]] = swath_surface_velocities[update_mask]
+            self._grid.at_node['glacier__wetted_perimeter'][swath_nodes[update_mask]] = wetted_perimeter
 
 
         erosion_rate = self._erosion_const * (self._grid.at_node['ice__basal_velocity'])**self._erosion_exp
