@@ -7,6 +7,7 @@ import numpy as np
 from pathlib import Path
 from collections import deque
 from scipy.interpolate import RegularGridInterpolator
+from scipy.spatial import KDTree
 
 PI = 3.14159265359
 SECPERYEAR = 31556926
@@ -366,25 +367,16 @@ class GlacialErosion(Component):
             # else: stays as -1 (no donor)
 
     def _calc_swaths(self):
-        self.swaths = []
+        coords = np.column_stack([self._grid.node_x, self._grid.node_y])
+        half_widths = self._grid.at_node['glacier__width'] / 2
+        tree = KDTree(coords)
+
+        # query_ball_point returns, for each center node, all nodes within its half-width radius
+        self.swaths = tree.query_ball_point(coords, half_widths, eps=1e-6)
+
         swaths_number_of_nodes = np.zeros(self._grid.number_of_nodes)
-
-        for center_node in range(self._grid.number_of_nodes):
-            if self._grid.at_node['glacier__width'][center_node]/2 > self._grid.dx:
-                width_swath = self._grid.at_node['glacier__width'][center_node]
-                dx = self._grid.node_x - self._grid.node_x[center_node]
-                dy = self._grid.node_y - self._grid.node_y[center_node]
-                distances = np.sqrt(dx**2 + dy**2)
-                swath = np.where((distances > 0) & (distances < width_swath/2))[0].tolist()
-                swath = [center_node] + swath
-
-            else:
-                swath = [center_node]
-
-            self.swaths.append(swath)
-
-            for node in swath:
-                swaths_number_of_nodes[node] = max(len(swath), swaths_number_of_nodes[node])
+        for swath in self.swaths:
+            np.maximum.at(swaths_number_of_nodes, swath, len(swath))
 
         _ = self._grid.add_field('glacier__swath_number_of_nodes', swaths_number_of_nodes, clobber=True)
 
@@ -628,7 +620,8 @@ class GlacialErosion(Component):
         normalized_crosssectional_areas = self._calculate_lookup_overlap(bin_distances_normalized, bin_widths_normalized, ice_thicknesses_normalized)
         crosssectional_areas = normalized_crosssectional_areas * largest_distance * corrected_thickness
         wetted_perimeter = self._calculate_wetted_perimeter(corrected_thickness, bin_distances, bin_elevations_topo * _cosarctan(slope))
-        sliding_velocity = self._sliding_velocity_nye(slope, crosssectional_areas.sum(), wetted_perimeter)
+        #sliding_velocity = self._sliding_velocity_nye(slope, crosssectional_areas.sum(), wetted_perimeter)
+        sliding_velocity = self._sliding_velocity_1D(corrected_thickness, slope)
 
         k = self._density_ice * self._grav_accel * corrected_thickness * _sinarctan(abs(slope))
         velocity_profile = corrected_thickness * self._glen_const * k**self._glen_exp * nondimensional_velocity_profile
