@@ -52,6 +52,7 @@ class GlacialErosion(Component):
         erosion_exp = 2,
         erosion_const = 2.5*10**(-6),
         glen_const = 24*10**(-25),
+        n_flow_cells = 2,
         ):
         
         """Initialize the GlacialErosion model.
@@ -90,6 +91,8 @@ class GlacialErosion(Component):
             Basal velocity to erosion rate proportionality constant (units vary depending on the value of erosion_exp). Defaults to 2.5*10**(-6) a/m (Braedstrup et al., 2016).
         glen_const : float
             Glen-Nye flow law proportionality constant (units vary depending on the value of glen_exp). Defaults to 24*10**(-25) s^-1 Pa^-3 (Budd & Jacka 1989, Cuffey & Patterson: The Physics of Glaciers).
+        n_flow_cells : int
+            Number of cells to follow upstream and downstream when computing flow direction and slope. The slope and direction are computed between the node n_flow_cells steps upstream and n_flow_cells steps downstream, averaging over 2*n_flow_cells+1 cells total. Defaults to 2.
         """
 
         super().__init__(grid)
@@ -112,6 +115,7 @@ class GlacialErosion(Component):
         self._erosion_exp = erosion_exp
         self._erosion_const = erosion_const
         self._glen_const = glen_const
+        self._n_flow_cells = n_flow_cells
 
         self._precipitation_rate = precipitation_rate
         self._discharge_override = discharge_override
@@ -315,36 +319,6 @@ class GlacialErosion(Component):
         horizontal_distance = (delta_x**2 + delta_y**2)**0.5
         return horizontal_distance, delta_x, delta_y, delta_z
 
-    def _follow_downstream(self, starting_node, receiver_array, max_distance):
-        '''
-        Follows nodes downstream until the max_distance is reached. Can be used to follow upstream if instead a largest donor array is used as input.
-
-        starting_node : int 
-            Node ID of the starting node
-        receiver_array : numpy array
-            array indicating the receiver (or largest donor) node of every node's dicharge
-        max_distance : float
-            Maximum radius to follow nodes to.
-        '''
-        current_node = starting_node
-        
-        while True:
-            next_node = receiver_array[current_node]
-
-            if next_node == current_node:  # No more receivers/donors
-                break
-            
-            distance, _, _, _ = self._delta_two_nodes(starting_node, next_node)
-            
-            if distance > max_distance:  # Outside range
-                break
-            
-            current_node = next_node
-
-        final_node = current_node
-
-        return final_node
-    
     def _build_donor_dict(self):
         """Build a dictionary mapping each node to its donors."""
         self._donor_dict = {i: [] for i in range(self._grid.number_of_nodes)}
@@ -382,40 +356,37 @@ class GlacialErosion(Component):
 
     def _calc_flow_directions(self, elevation_field="topographic__elevation"):
         """Calculate 2D flow direction components and slopes for all nodes.
-        Computed from the distances between upstream and downstream edge nodes of the swath.
+        Computed between the nodes n_flow_cells steps upstream and downstream.
         Stores results as grid fields.
 
         elevation_field : str
             Grid field to use for slope calculation (default: "topographic__elevation").
             Pass "ice__elevation" to compute ice surface slope instead.
         """
-        # Initialize arrays
-        num_nodes = self._grid.number_of_nodes
-        flow_x_normalized = np.zeros(num_nodes)
-        flow_y_normalized = np.zeros(num_nodes)
-        slope = np.zeros(num_nodes)
         receivers = self._grid.at_node["flow__receiver_node"]
         donors = self._largest_donor
 
-        for center_node in range(num_nodes):
-            width = self._grid.at_node['glacier__width'][center_node]
+        # Walk n_flow_cells steps along the flow network for all nodes simultaneously
+        downstream = np.arange(self._grid.number_of_nodes)
+        upstream = np.arange(self._grid.number_of_nodes)
+        for _ in range(self._n_flow_cells):
+            downstream = receivers[downstream]
+            upstream = donors[upstream]
 
-            upstream_node = self._follow_downstream(center_node, donors, width/2)
-            downstream_node = self._follow_downstream(center_node, receivers, width/2)
-            horizontal_distance, delta_x, delta_y, delta_z = self._delta_two_nodes(downstream_node, upstream_node, elevation_field=elevation_field)
+        # Vectorised slope and direction between upstream and downstream endpoints
+        elevation = self._grid.at_node[elevation_field]
+        delta_x = self._grid.node_x[downstream] - self._grid.node_x[upstream]
+        delta_y = self._grid.node_y[downstream] - self._grid.node_y[upstream]
+        delta_z = elevation[downstream] - elevation[upstream]
+        horizontal_distance = np.sqrt(delta_x**2 + delta_y**2)
 
-            if horizontal_distance != 0:
-                flow_x_normalized[center_node] = delta_x / horizontal_distance
-                flow_y_normalized[center_node] = delta_y / horizontal_distance
-                slope[center_node] = delta_z / horizontal_distance
-            else:
-                flow_x_normalized[center_node] = 0.0
-                flow_y_normalized[center_node] = 0.0
-                slope[center_node] = 0.0
+        nonzero = horizontal_distance > 0
+        flow_x = np.where(nonzero, delta_x / horizontal_distance, 0.0)
+        flow_y = np.where(nonzero, delta_y / horizontal_distance, 0.0)
+        slope = np.where(nonzero, delta_z / horizontal_distance, 0.0)
 
-        # Store as grid fields
-        self._grid.add_field('glacier__flow_direction_x', flow_x_normalized, clobber=True)
-        self._grid.add_field('glacier__flow_direction_y', flow_y_normalized, clobber=True)
+        self._grid.add_field('glacier__flow_direction_x', flow_x, clobber=True)
+        self._grid.add_field('glacier__flow_direction_y', flow_y, clobber=True)
         self._grid.add_field('glacier__slope', slope, clobber=True)
 
     def determine_flow(self, use_ice_elevation=True):
