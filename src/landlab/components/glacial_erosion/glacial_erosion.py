@@ -590,6 +590,16 @@ class GlacialErosion(Component):
 
         return perimeter
 
+    def _sliding_velocity_1D(self, center_thickness, slope):
+        fs = (self._density_ice*self._grav_accel)**self._glen_exp * self._sliding_const
+        sliding_velocity = fs * center_thickness ** (self._glen_exp - 1) * abs(slope)**self._glen_exp
+        return sliding_velocity
+    
+    def _sliding_velocity_nye(self, slope, cross_sectional_area, wetted_perimeter):
+        basal_shear_stress = self._density_ice * self._grav_accel * cross_sectional_area / wetted_perimeter * _sinarctan(abs(slope))
+        sliding_velocity = self._sliding_const * basal_shear_stress ** (0.5*(self._glen_exp + 1))
+        return sliding_velocity
+
     def _discharge_from_thickness(self, center_thickness, bin_distances, bin_widths, bin_elevations_topo, slope):
         corrected_thickness = center_thickness * _cosarctan(slope)
         
@@ -615,17 +625,16 @@ class GlacialErosion(Component):
         bin_widths_normalized = bin_widths / largest_distance
         ice_thicknesses_normalized = ice_thicknesses / center_thickness
 
-        normalized_crosssectional_area = self._calculate_lookup_overlap(bin_distances_normalized, bin_widths_normalized, ice_thicknesses_normalized)
-        crosssectional_area = normalized_crosssectional_area * largest_distance * center_thickness
-        wetted_perimeter = self._calculate_wetted_perimeter(center_thickness, bin_distances, bin_elevations_topo)
-        fs = (self._density_ice*self._grav_accel)**self._glen_exp * self._sliding_const
-        sliding_velocity = fs * center_thickness ** (self._glen_exp - 1) * abs(slope)**self._glen_exp
-        
+        normalized_crosssectional_areas = self._calculate_lookup_overlap(bin_distances_normalized, bin_widths_normalized, ice_thicknesses_normalized)
+        crosssectional_areas = normalized_crosssectional_areas * largest_distance * corrected_thickness
+        wetted_perimeter = self._calculate_wetted_perimeter(corrected_thickness, bin_distances, bin_elevations_topo * _cosarctan(slope))
+        sliding_velocity = self._sliding_velocity_nye(slope, crosssectional_areas.sum(), wetted_perimeter)
+
         k = self._density_ice * self._grav_accel * corrected_thickness * _sinarctan(abs(slope))
         velocity_profile = corrected_thickness * self._glen_const * k**self._glen_exp * nondimensional_velocity_profile
 
-        deformation_discharge = velocity_profile * crosssectional_area
-        sliding_discharge = sliding_velocity * crosssectional_area
+        deformation_discharge = velocity_profile * crosssectional_areas
+        sliding_discharge = sliding_velocity * crosssectional_areas
         discharge = sliding_discharge + deformation_discharge
         discharge_sum = discharge.sum()
 
