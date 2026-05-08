@@ -49,6 +49,7 @@ class GlacialErosion(Component):
         grav_accel = 9.8,
         glen_exp = 3, #Not used at the moment, hardcoded, equations need updating.
         sliding_const = 10**(-19),
+        sliding_exp = 2,
         erosion_exp = 2,
         erosion_const = 2.5*10**(-6),
         glen_const = 24*10**(-25),
@@ -85,6 +86,8 @@ class GlacialErosion(Component):
             Glen-Nye flow law exponent. Defaults to 3.
         sliding_const : float
             Sliding velocity proportionality constant [m^2 s^-1 Pa^-3]. Defaults to 10**(-19) (Prasicek et al., 2020).
+        sliding_exp : float
+            Sliding velocity to basal velocity power law exponent. Defaults to 2.
         erosion_exp : float
             Basal velocity to erosion rate power law exponent. Defaults to 2.
         erosion_const : float
@@ -112,6 +115,7 @@ class GlacialErosion(Component):
         self._grav_accel = grav_accel
         self._glen_exp = glen_exp
         self._sliding_const = sliding_const
+        self._sliding_exp = sliding_exp
         self._erosion_exp = erosion_exp
         self._erosion_const = erosion_const
         self._glen_const = glen_const
@@ -381,13 +385,72 @@ class GlacialErosion(Component):
         horizontal_distance = np.sqrt(delta_x**2 + delta_y**2)
 
         nonzero = horizontal_distance > 0
-        flow_x = np.where(nonzero, delta_x / horizontal_distance, 0.0)
-        flow_y = np.where(nonzero, delta_y / horizontal_distance, 0.0)
-        slope = np.where(nonzero, delta_z / horizontal_distance, 0.0)
+        safe_distance = np.where(nonzero, horizontal_distance, 1.0)
+        flow_x = np.where(nonzero, delta_x / safe_distance, 0.0)
+        flow_y = np.where(nonzero, delta_y / safe_distance, 0.0)
+        slope = np.where(nonzero, delta_z / safe_distance, 0.0)
 
         self._grid.add_field('glacier__flow_direction_x', flow_x, clobber=True)
         self._grid.add_field('glacier__flow_direction_y', flow_y, clobber=True)
         self._grid.add_field('glacier__slope', slope, clobber=True)
+
+    def _estimate_width(self, mode='empirical'):
+
+        discharge_per_year = self._grid.at_node['glacier__discharge']  # m^3/year
+        discharge_per_second = discharge_per_year / SECPERYEAR  # m^3/s, needed for physics-based radius calcs
+        slope = self._grid.at_node['glacier__slope']
+        n = self._glen_exp
+        m = self._sliding_exp
+
+        # Use abs(slope) so B is non-negative; guard against zero slope to avoid division by zero.
+        abs_slope = np.abs(slope)
+        B = 0.5 * self._density_ice * self._grav_accel * abs_slope
+        safe_B_n = np.where(B > 0, B**n, np.nan)
+        radius_def = np.where(B > 0, (discharge_per_second / (PI * self._glen_const * safe_B_n) * (2*n+6))**(1/(n+3)), 0.0)
+
+        if mode == 'empirical':
+            # Use Hergarten's rule
+            radius_slide = (discharge_per_year*self._grid.dx)**self._width_scaling_exp
+        elif mode == 'nye':
+            # Calculate glacier width from a sliding law of the form u_s = A_s*tau^m, assuming a semicircular glacier
+            safe_B_m = np.where(B > 0, B**m, np.nan)
+            radius_slide = np.where(B > 0, (discharge_per_second / (self._sliding_const * safe_B_m * 0.5 * PI))**(1/(m+2)), 0.0)
+        elif mode == '1D':
+            # Calculate glacier width from a sliding law of the form u_s = f_s* H**(n-1) * slope**n, assuming a semicircular glacier
+            f_s = (self._density_ice*self._grav_accel)**n * self._sliding_const
+            safe_slope_n = np.where(abs_slope > 0, abs_slope**n, np.nan)
+            radius_slide = np.where(abs_slope > 0, (discharge_per_second / (f_s * safe_slope_n * 0.5 * PI))**(1/(n+1)), 0.0)
+
+        if mode == 'empirical':
+            radius_estimate = radius_slide
+        else:
+            radius_estimate = np.minimum(radius_def, radius_slide)
+
+        glacier_width = self._width_scaling_const*radius_estimate
+        _ = self._grid.add_field('glacier__radius_estimate', radius_estimate, clobber=True)
+        _ = self._grid.add_field('glacier__width', glacier_width, clobber=True)
+        _ = self._grid.add_field('glacier__sliding_radius', radius_slide, clobber=True)
+        _ = self._grid.add_field('glacier__deformation_radius', radius_def, clobber=True)
+
+    def _classify_node_procedure(self):
+        '''Classify nodes based on estimated radius and/or slope. Classes are as follows:
+        0: No ice flow (discharge = 0 or slope is below threshold)
+        1: Simplified ice flow (predicted radius is smaller than grid spacing, sub-grid glacier)
+        2: Full ice flow (predicted radius is larger than grid spacing, resolved glacier)
+        '''
+        node_procedures = np.zeros(self._grid.number_of_nodes, dtype=int)
+
+        nonzero_discharge = self._grid.at_node['glacier__discharge'] > 0
+        node_procedures[nonzero_discharge] = 2  # Full ice flow procedure
+
+        smaller_than_dx = self._grid.at_node['glacier__radius_estimate'] < self._grid.dx
+        node_procedures[smaller_than_dx] = 1  # Sub-grid glacier procedure
+
+        slope_threshold = -0.01
+        low_slope = np.abs(self._grid.at_node['glacier__slope']) > slope_threshold
+        node_procedures[low_slope] = 0  # No ice flow
+
+        _ = self._grid.add_field('glacier__node_procedure', node_procedures, clobber=True)
 
     def determine_flow(self, use_ice_elevation=True):
         if self._equilibrium_line_altitude == None or self._full_ice_altitude == None:
@@ -426,17 +489,14 @@ class GlacialErosion(Component):
         #TODO: Remove the temporary surface_water__discharge field to avoid confusion
         #TODO: Run flowrouter again with precipitation of water? 
 
-        # Calculate glacier width
-        glacier_width = self._width_scaling_const*(glacier_discharge*self._grid.dx)**self._width_scaling_exp
-        _ = self._grid.add_field('glacier__width', glacier_width, clobber=True)
-
-
         self._build_donor_dict()  # Pre-compute donor relationships
         self._obtain_largest_donors() #Pre-compute largest donors for every node
         elevation_field = "topographic__elevation"
         if use_ice_elevation and 'ice__elevation' in self._grid.at_node:
             elevation_field = 'ice__elevation'
         self._calc_flow_directions(elevation_field=elevation_field) #Pre-compute flow directions and slope
+        self._estimate_width(mode='1D') 
+        self._classify_node_procedure()
         self._calc_swaths()
         self._upstream_node_order = self._grid.at_node['flow__upstream_node_order'].copy()
     
@@ -560,7 +620,7 @@ class GlacialErosion(Component):
     
     def _sliding_velocity_nye(self, slope, cross_sectional_area, wetted_perimeter):
         basal_shear_stress = self._density_ice * self._grav_accel * cross_sectional_area / wetted_perimeter * _sinarctan(abs(slope))
-        sliding_velocity = self._sliding_const * basal_shear_stress ** (0.5*(self._glen_exp + 1))
+        sliding_velocity = self._sliding_const * basal_shear_stress ** self._sliding_exp
         return sliding_velocity
 
     def _discharge_from_thickness(self, center_thickness, bin_distances, bin_widths, bin_elevations_topo, slope):
@@ -681,7 +741,7 @@ class GlacialErosion(Component):
 
         if verbose_mode:
             print(f"Converged after {iteration} iterations: thickness={converged_thickness:.8f}, discharge={predicted_discharge:.8f} (target={target_discharge:.8f})")
-            #input("Press Enter to continue...")
+            input("Press Enter to continue...")
 
         return converged_thickness, largest_distance, velocity_profile, predicted_discharge, sliding_velocity, wetted_perimeter
     
