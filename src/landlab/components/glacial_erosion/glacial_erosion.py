@@ -410,7 +410,7 @@ class GlacialErosion(Component):
 
         if mode == 'empirical':
             # Use Hergarten's rule
-            radius_slide = (discharge_per_year*self._grid.dx)**self._width_scaling_exp
+            radius_slide = (discharge_per_year)**self._width_scaling_exp
         elif mode == 'nye':
             # Calculate glacier width from a sliding law of the form u_s = A_s*tau^m, assuming a semicircular glacier
             safe_B_m = np.where(B > 0, B**m, np.nan)
@@ -432,23 +432,25 @@ class GlacialErosion(Component):
         _ = self._grid.add_field('glacier__sliding_radius', radius_slide, clobber=True)
         _ = self._grid.add_field('glacier__deformation_radius', radius_def, clobber=True)
 
-    def _classify_node_procedure(self):
+    def _classify_node_procedures(self):
         '''Classify nodes based on estimated radius and/or slope. Classes are as follows:
         0: No ice flow (discharge = 0 or slope is below threshold)
         1: Simplified ice flow (predicted radius is smaller than grid spacing, sub-grid glacier)
         2: Full ice flow (predicted radius is larger than grid spacing, resolved glacier)
         '''
-        node_procedures = np.zeros(self._grid.number_of_nodes, dtype=int)
-
-        nonzero_discharge = self._grid.at_node['glacier__discharge'] > 0
-        node_procedures[nonzero_discharge] = 2  # Full ice flow procedure
+        node_procedures = np.full(self._grid.number_of_nodes, 2, dtype=int)
 
         smaller_than_dx = self._grid.at_node['glacier__radius_estimate'] < self._grid.dx
         node_procedures[smaller_than_dx] = 1  # Sub-grid glacier procedure
 
-        slope_threshold = -0.01
-        low_slope = np.abs(self._grid.at_node['glacier__slope']) > slope_threshold
-        node_procedures[low_slope] = 0  # No ice flow
+        slope_threshold = -0.05
+        invalid_slope = self._grid.at_node['glacier__slope'] > slope_threshold
+        node_procedures[invalid_slope] = 0  # No ice flow
+        self._grid.at_node['glacier__width'] = np.where(invalid_slope, 0, self._grid.at_node['glacier__width']) # Set width to zero for no-flow nodes to prevent numerical issues in erosion calculation
+
+        discharge_threshold = 0
+        no_discharge = self._grid.at_node['glacier__discharge'] <= discharge_threshold
+        node_procedures[no_discharge] = 0  # No ice flow
 
         _ = self._grid.add_field('glacier__node_procedure', node_procedures, clobber=True)
 
@@ -496,7 +498,7 @@ class GlacialErosion(Component):
             elevation_field = 'ice__elevation'
         self._calc_flow_directions(elevation_field=elevation_field) #Pre-compute flow directions and slope
         self._estimate_width(mode='1D') 
-        self._classify_node_procedure()
+        self._classify_node_procedures()
         self._calc_swaths()
         self._upstream_node_order = self._grid.at_node['flow__upstream_node_order'].copy()
     
@@ -799,9 +801,13 @@ class GlacialErosion(Component):
         glacier_width = self._grid.at_node['glacier__width']
         thickness_guess = glacier_width * self._thickness_to_width_ratio_guess
 
-        for center_node in reversed(self._upstream_node_order):
-            if self._grid.at_node['glacier__discharge'][center_node] <= 0 or self._grid.at_node['glacier__slope'][center_node] >= -0.001:
-                continue  # Skip nodes with no discharge or very low slope (or uphill), as they will have little to no ice flow and therefore won't contribute to erosion. This also prevents numerical issues in the discharge iteration for these nodes.
+        node_procedure = self._grid.at_node['glacier__node_procedure']
+
+        # Procedure 1 (sub-grid glacier): direct calculation — set to zero for now (no-op, fields already zeroed above)
+
+        # Procedure 2 (resolved glacier): full iterative solve, upstream-to-downstream order
+        full_nodes = self._upstream_node_order[node_procedure[self._upstream_node_order] == 2]
+        for center_node in reversed(full_nodes):
 
             # Calculate swath characteristics
             swath_distances, swath_distances_along, swath_distances_perp, swath_relative_elevations = self._swath_characteristics(center_node)
