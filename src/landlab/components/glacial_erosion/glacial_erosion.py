@@ -40,7 +40,7 @@ class GlacialErosion(Component):
         full_ice_altitude=None,
         precipitation_rate=1.,
         discharge_threshold=1E6,
-        slope_threshold=0.05,
+        slope_threshold=0.02,
         discharge_override=None,
         nonlinear_mass_balance=False,
         melt_rate_scaling_factor=1,
@@ -57,6 +57,7 @@ class GlacialErosion(Component):
         erosion_const = 2.5*10**(-6),
         glen_const = 24*10**(-25),
         n_flow_cells = 2,
+        uplift_rate = 0
         ):
         
         """Initialize the GlacialErosion model.
@@ -103,6 +104,8 @@ class GlacialErosion(Component):
             Glen-Nye flow law proportionality constant (units vary depending on the value of glen_exp). Defaults to 24*10**(-25) s^-1 Pa^-3 (Budd & Jacka 1989, Cuffey & Patterson: The Physics of Glaciers).
         n_flow_cells : int
             Number of cells to follow upstream and downstream when computing flow direction and slope. The slope and direction are computed between the node n_flow_cells steps upstream and n_flow_cells steps downstream, averaging over 2*n_flow_cells+1 cells total. Defaults to 2.
+        uplift_rate : array or float
+            Rate of uplift to add to the topography at each time step (m/a). Defaults to 0 (no uplift).
         """
 
         super().__init__(grid)
@@ -128,6 +131,10 @@ class GlacialErosion(Component):
         self._erosion_const = erosion_const
         self._glen_const = glen_const
         self._n_flow_cells = n_flow_cells
+        self.uplift_rate = uplift_rate
+        # Check if uplift rate is an array, and if so, set to 0 at the boundary nodes
+        if isinstance(self.uplift_rate, np.ndarray):
+            self.uplift_rate[self._grid.boundary_nodes] = 0
 
         self._precipitation_rate = precipitation_rate
         self._discharge_threshold = discharge_threshold
@@ -400,12 +407,15 @@ class GlacialErosion(Component):
         flow_y = np.where(nonzero, delta_y / safe_distance, 0.0)
         slope = np.where(nonzero, delta_z / safe_distance, 0.0)
 
+        # Prevent holes by setting slope to 0 when the local topography is below the receiver node elevation.
+        in_overdeepening = elevation < elevation[downstream]
+        slope = np.where(in_overdeepening, 0.0, slope)
+
         self._grid.add_field('glacier__flow_direction_x', flow_x, clobber=True)
         self._grid.add_field('glacier__flow_direction_y', flow_y, clobber=True)
         self._grid.add_field('glacier__slope', slope, clobber=True)
 
     def _estimate_width(self):
-        mode = self._sliding_procedure
         discharge_per_year = self._grid.at_node['glacier__discharge']  # m^3/year
         discharge_per_second = discharge_per_year / SECPERYEAR  # m^3/s, needed for physics-based radius calcs
         slope = self._grid.at_node['glacier__slope']
@@ -418,6 +428,7 @@ class GlacialErosion(Component):
         safe_B_n = np.where(B > 0, B**n, np.nan)
         radius_def = np.where(B > 0, (discharge_per_second / (PI * self._glen_const * safe_B_n) * (2*n+6))**(1/(n+3)), 0.0)
 
+        mode = self._sliding_procedure
         if mode == 'empirical':
             # Use Hergarten's rule
             radius_slide = (discharge_per_year)**self._width_scaling_exp
@@ -504,8 +515,8 @@ class GlacialErosion(Component):
         self._build_donor_dict()  # Pre-compute donor relationships
         self._obtain_largest_donors() #Pre-compute largest donors for every node
         elevation_field = "topographic__elevation"
-        if use_ice_elevation and 'ice__elevation' in self._grid.at_node:
-            elevation_field = 'ice__elevation'
+        #if use_ice_elevation and 'ice__elevation' in self._grid.at_node:
+        #    elevation_field = 'ice__elevation'
         self._calc_flow_directions(elevation_field=elevation_field) #Pre-compute flow directions and slope
         self._estimate_width() 
         self._classify_node_procedures()
@@ -803,6 +814,7 @@ class GlacialErosion(Component):
     def calc_ice(self):
         topography = self._grid.at_node["topographic__elevation"]
         _ = self._grid.add_field('ice__thickness', np.zeros(self._grid.number_of_nodes), clobber=True)
+        _ = self._grid.add_field('ice__flowing_thickness', np.zeros(self._grid.number_of_nodes), clobber=True)
         _ = self._grid.add_field('ice__basal_velocity', np.zeros(self._grid.number_of_nodes), clobber=True)
         _ = self._grid.add_field('ice__surface_velocity', np.zeros(self._grid.number_of_nodes), clobber=True)
         _ = self._grid.add_field('glacier__cross_section', np.zeros(self._grid.number_of_nodes), clobber=True)
@@ -844,6 +856,8 @@ class GlacialErosion(Component):
             self._grid.at_node['ice__surface_velocity'][swath_nodes[update_mask]] = swath_surface_velocities[update_mask]
             self._grid.at_node['glacier__wetted_perimeter'][swath_nodes[update_mask]] = wetted_perimeter
 
+            thickness_mask = ice_thicknesses > self._grid.at_node['ice__thickness'][swath_nodes]
+            self._grid.at_node['ice__thickness'][swath_nodes[thickness_mask]] = ice_thicknesses[thickness_mask]
 
         erosion_rate = self._erosion_const * (self._grid.at_node['ice__basal_velocity'])**self._erosion_exp
 
@@ -852,15 +866,22 @@ class GlacialErosion(Component):
     
     # --- Erosion ---
     def run_one_step(self, dt, stabilise_erosion=False):
-        self.calc_ice()
+        boundary_nodes = self._grid.boundary_nodes
+        core_nodes = self._grid.core_nodes
 
-        erosion_elevation = self._grid.at_node["topographic__elevation"] - self._grid.at_node['ice__erosion_rate']*dt
+        erosion_rate = self._grid.at_node['ice__erosion_rate']
+        erosion_rate[boundary_nodes] = 0
+        
+        erosion_elevation = self._grid.at_node["topographic__elevation"] - erosion_rate*dt
 
         if stabilise_erosion == True:
             receiver_elevation = self._grid.at_node["topographic__elevation"][self._grid.at_node['flow__receiver_node']]
             self._grid.at_node["topographic__elevation"] = np.maximum(erosion_elevation, receiver_elevation)
         else:
             self._grid.at_node["topographic__elevation"] = erosion_elevation
+
+        self._grid.at_node['topographic__elevation'][core_nodes] += self.uplift_rate*dt
+        #TODO: make the above work for array uplift rates
 
     def erode_topography(self, number_of_years=100, max_erosion=2, flowroute_recalc_interval=10):
         always_recalc_flowroute = False
@@ -883,16 +904,15 @@ class GlacialErosion(Component):
 
             dt = max_erosion/highest_erosion_rate
 
-            if years_elapsed + dt >= number_of_years:
+            if flowroute_recalc_stops and years_elapsed + dt >= flowroute_recalc_stops[0]:
+                dt = flowroute_recalc_stops[0] - years_elapsed
+                flowroute_recalc_stops.pop(0)
+                self.determine_flow()
+            elif years_elapsed + dt >= number_of_years:
                 dt = number_of_years - years_elapsed
-            elif flowroute_recalc_stops:
-                if years_elapsed + dt >= flowroute_recalc_stops[0]:
-                    dt = flowroute_recalc_stops[0] - years_elapsed
-                    flowroute_recalc_stops.pop(0)
-                    self.determine_flow()
             elif always_recalc_flowroute is True:
                 self.determine_flow()
             
-            self._grid.at_node["topographic__elevation"] -= self._grid.at_node['ice__erosion_rate']*dt
+            self.run_one_step(dt)
             years_elapsed += dt
             print('dt =', dt, 'years elapsed:', years_elapsed)
