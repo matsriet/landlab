@@ -387,18 +387,41 @@ class GlacialErosion(Component):
         receivers = self._grid.at_node["flow__receiver_node"]
         donors = self._largest_donor
 
-        # Walk n_flow_cells steps along the flow network for all nodes simultaneously
-        downstream = np.arange(self._grid.number_of_nodes)
+        # Boolean mask of boundary nodes for ghost-cell clamping
+        is_boundary = np.zeros(self._grid.number_of_nodes, dtype=bool)
+        is_boundary[self._grid.boundary_nodes] = True
+
+        # Walk n_flow_cells steps along the flow network for all nodes simultaneously.
+        # Downstream uses float positions so ghost cells can be extrapolated beyond
+        # the boundary: once a node's downstream path hits a boundary, remaining steps
+        # extend the position in the overall upstream→downstream direction (scaled to
+        # one grid cell per step) while keeping the boundary node's elevation.
+        downstream_idx = np.arange(self._grid.number_of_nodes)
+        downstream_x = self._grid.node_x.copy().astype(float)
+        downstream_y = self._grid.node_y.copy().astype(float)
         upstream = np.arange(self._grid.number_of_nodes)
         for _ in range(self._n_flow_cells):
-            downstream = receivers[downstream]
+            at_boundary = is_boundary[downstream_idx]
+            next_idx = receivers[downstream_idx]
+
+            # Overall direction from current upstream endpoint to current downstream position
+            dir_x = downstream_x - self._grid.node_x[upstream]
+            dir_y = downstream_y - self._grid.node_y[upstream]
+            dir_len = np.sqrt(dir_x**2 + dir_y**2)
+            safe_len = np.where(dir_len > 0, dir_len, 1.0)
+            ghost_step_x = dir_x / safe_len * self._grid.dx
+            ghost_step_y = dir_y / safe_len * self._grid.dx
+
+            downstream_x = np.where(at_boundary, downstream_x + ghost_step_x, self._grid.node_x[next_idx])
+            downstream_y = np.where(at_boundary, downstream_y + ghost_step_y, self._grid.node_y[next_idx])
+            downstream_idx = np.where(at_boundary, downstream_idx, next_idx)
             upstream = donors[upstream]
 
         # Vectorised slope and direction between upstream and downstream endpoints
         elevation = self._grid.at_node[elevation_field]
-        delta_x = self._grid.node_x[downstream] - self._grid.node_x[upstream]
-        delta_y = self._grid.node_y[downstream] - self._grid.node_y[upstream]
-        delta_z = elevation[downstream] - elevation[upstream]
+        delta_x = downstream_x - self._grid.node_x[upstream]
+        delta_y = downstream_y - self._grid.node_y[upstream]
+        delta_z = elevation[downstream_idx] - elevation[upstream]
         horizontal_distance = np.sqrt(delta_x**2 + delta_y**2)
 
         nonzero = horizontal_distance > 0
@@ -408,7 +431,7 @@ class GlacialErosion(Component):
         slope = np.where(nonzero, delta_z / safe_distance, 0.0)
 
         # Prevent holes by setting slope to 0 when the local topography is below the receiver node elevation.
-        in_overdeepening = elevation < elevation[downstream]
+        in_overdeepening = elevation < elevation[downstream_idx]
         slope = np.where(in_overdeepening, 0.0, slope)
 
         self._grid.add_field('glacier__flow_direction_x', flow_x, clobber=True)
@@ -471,6 +494,9 @@ class GlacialErosion(Component):
         no_discharge = self._grid.at_node['glacier__discharge'] == 0
         node_procedures[no_discharge] = 0
 
+        boundary_nodes = self._grid.boundary_nodes
+        node_procedures[boundary_nodes] = 0
+
         self._grid.at_node['glacier__width'] = np.where(node_procedures < 3, 0, self._grid.at_node['glacier__width']) # Set width to zero for no-flow nodes
 
         _ = self._grid.add_field('glacier__node_procedure', node_procedures, clobber=True)
@@ -515,8 +541,8 @@ class GlacialErosion(Component):
         self._build_donor_dict()  # Pre-compute donor relationships
         self._obtain_largest_donors() #Pre-compute largest donors for every node
         elevation_field = "topographic__elevation"
-        #if use_ice_elevation and 'ice__elevation' in self._grid.at_node:
-        #    elevation_field = 'ice__elevation'
+        if use_ice_elevation and 'ice__elevation' in self._grid.at_node:
+            elevation_field = 'ice__elevation'
         self._calc_flow_directions(elevation_field=elevation_field) #Pre-compute flow directions and slope
         self._estimate_width() 
         self._classify_node_procedures()
