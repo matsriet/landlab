@@ -442,6 +442,9 @@ class GlacialErosion(Component):
         discharge_per_year = self._grid.at_node['glacier__discharge']  # m^3/year
         discharge_per_second = discharge_per_year / SECPERYEAR  # m^3/s, needed for physics-based radius calcs
         slope = self._grid.at_node['glacier__slope']
+        low_slope = slope > -self._slope_threshold
+        slope[low_slope] = -self._slope_threshold #Limit width calculations at low slopes to the threshold
+
         n = self._glen_exp
         m = self._sliding_exp
 
@@ -854,7 +857,7 @@ class GlacialErosion(Component):
 
         node_procedure = self._grid.at_node['glacier__node_procedure']
 
-        target_nodes = self._upstream_node_order[node_procedure[self._upstream_node_order] == 3]
+        target_nodes = self._upstream_node_order[node_procedure[self._upstream_node_order] >= 2]
         for center_node in reversed(target_nodes):
 
             # Calculate swath characteristics
